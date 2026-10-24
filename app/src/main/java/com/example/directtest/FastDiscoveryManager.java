@@ -42,6 +42,16 @@ import android.net.wifi.WifiP2pConfig;
 import android.net.wifi.WifiP2pInfo;
 import android.net.wifi.WpsInfo;
 
+import com.example.directtest.fast.BinaryFrame;
+import com.example.directtest.fast.BloomFilter;
+import com.example.directtest.fast.CorrelationLog;
+import com.example.directtest.fast.GroupLinkChannel;
+import com.example.directtest.fast.HwGuard;
+import com.example.directtest.fast.LinkQuality;
+import com.example.directtest.fast.PeerClock;
+import com.example.directtest.fast.Protocol;
+import com.example.directtest.fast.RelayCache;
+import com.example.directtest.fast.SyncWindow;
 import com.example.directtest.transport.P2pSocketTransport;
 
 public class FastDiscoveryManager {
@@ -140,6 +150,37 @@ public class FastDiscoveryManager {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final DiagnosticLogger log = DiagnosticLogger.getInstance();
 
+    // ==================== БЫСТРЫЙ ПУТЬ И КОРРЕЛЯЦИЯ ====================
+
+    /** Структурированный журнал для сопоставления логов двух телефонов. */
+    private final CorrelationLog corr = CorrelationLog.get();
+
+    /** Расхождение часов с каждым собеседником — базис для окон поиска (A3). */
+    private final PeerClock peerClock = new PeerClock();
+
+    /** Качество быстрого канала: RTT/потери → адаптивные таймауты (B8). */
+    private final LinkQuality linkQuality = new LinkQuality();
+
+    /** Защита от лавины при ретрансляции (C6). */
+    private final RelayCache relayCache = new RelayCache();
+
+    /** UDP-канал внутри подсети группы (B2/B3). */
+    private GroupLinkChannel groupLink;
+
+    /** Отложенные публикации TXT-слотов: если быстрый канал успел — не публикуем (B1). */
+    private final Map<String, Runnable> pendingTxtFallbacks = new ConcurrentHashMap<>();
+
+    /**
+     * Слоты, зарезервированные под сообщения, которые ещё идут быстрым путём.
+     * Держим их отдельно от {@code messageSlots}: там запись означает уже
+     * зарегистрированный DNS-SD сервис, а освобождение записи удаляет
+     * {@code PendingMessage} — то есть отменило бы ожидание ACK.
+     */
+    private final Set<Integer> reservedSlots = Collections.synchronizedSet(new HashSet<>());
+
+    /** Счётчик фаз поиска для чередования discoverPeers/discoverServices (A2). */
+    private volatile int discoveryPhase = 0;
+
     // ==================== CONSTRUCTOR ====================
 
     public FastDiscoveryManager(Context context) {
@@ -179,6 +220,19 @@ public class FastDiscoveryManager {
         log.i("Loaded " + stateRepository.getAll().size() + " saved states, " + deviceCache.size() + " devices in cache");
         log.i("Android: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")");
         log.i("Model: " + Build.MODEL);
+
+        // Журнал корреляции открываем сразу: дальше каждое событие попадёт в
+        // файл с общим trace-идентификатором, пригодным для склейки логов
+        // двух телефонов.
+        corr.init(context, deviceId, sessionId);
+        corr.event(CorrelationLog.EV_START, null, null,
+                "role", "manager",
+                "model", Build.MANUFACTURER + "_" + Build.MODEL,
+                "api", String.valueOf(Build.VERSION.SDK_INT),
+                "proto", P2pConfig.PROTOCOL_VERSION,
+                "fast_path", P2pConfig.SOCKET_IS_PRIMARY_PATH ? "1" : "0",
+                "group_link", P2pConfig.ENABLE_GROUP_LINK_CHANNEL ? "1" : "0");
+        corr.event(CorrelationLog.EV_ENV, null, null, "env", HwGuard.describe(context));
     }
 
     /**
@@ -370,6 +424,7 @@ public class FastDiscoveryManager {
         setDeviceNameWithMarker();
         startSocketTransport();
         registerReceiver();
+        checkEnvironment();
         initializeAndStart();
 
         log.i("Service started, WiFi Lock: " + (wifiLock != null && wifiLock.isHeld()));
@@ -405,13 +460,27 @@ public class FastDiscoveryManager {
             manager.removeGroup(channel, null);
         }
 
-        // Останавливаем сокетный транспорт
+        // Останавливаем сокетный транспорт и UDP-канал группы
         stopSocketTransport();
+        stopGroupLink();
+
+        // Снимаем отложенные публикации TXT — иначе они сработают после stop()
+        for (Runnable fallback : pendingTxtFallbacks.values()) {
+            handler.removeCallbacks(fallback);
+        }
+        pendingTxtFallbacks.clear();
+        relayCache.clear();
+
+        corr.event(CorrelationLog.EV_STOP, null, null,
+                "devices", String.valueOf(deviceCache.size()),
+                "restarts", String.valueOf(discoveryRestartCount));
+        corr.flush();
 
         // Освобождаем WiFi Lock
         releaseWifiLock();
 
         messageSlots.clear();
+        reservedSlots.clear();
         pendingMessages.clear();
         serviceRequests.clear();
         deviceCache.clear();
@@ -425,6 +494,34 @@ public class FastDiscoveryManager {
 
         log.i("Stop complete. Discovery restarts: " + discoveryRestartCount);
         notifyStatus("Stopped");
+    }
+
+    /**
+     * Проверка окружения (D1–D5).
+     *
+     * Главное: на Xiaomi/Redmi/vivo при выключенном Location Mode
+     * discoverPeers отдаёт пустой список без ошибки. Пользователь видит
+     * «приложение не находит второй телефон», хотя дело в системной настройке.
+     * Поэтому проверяем явно, пишем в журнал и говорим текстом, что включить.
+     */
+    private void checkEnvironment() {
+        String problem = HwGuard.environmentProblem(context);
+        corr.event(CorrelationLog.EV_ENV, null, null,
+                "env", HwGuard.describe(context),
+                "problem", problem == null ? "none" : problem);
+
+        if (problem == null) {
+            log.success("[ENV] " + HwGuard.describe(context));
+            return;
+        }
+
+        log.error("[ENV] " + problem);
+        notifyStatus(problem);
+        if (!HwGuard.isLocationEnabled(context)) {
+            notifyError(problem);
+            // Подсказка по автозапуску — вторая по частоте причина «замолкания»
+            log.i("[ENV] " + HwGuard.autostartHint());
+        }
     }
 
     /**
@@ -487,6 +584,7 @@ public class FastDiscoveryManager {
             }
         }
         messageSlots.clear();
+        reservedSlots.clear();
 
         if (ackServiceInfo != null) {
             manager.removeLocalService(channel, ackServiceInfo, null);
@@ -595,26 +693,121 @@ public class FastDiscoveryManager {
             }
         }
 
-        registerMessageSlot(freeSlot, msgId, message, targetDeviceId);
+        // B1: сначала быстрый путь. Если он принял сообщение, публикация в
+        // TXT-слот откладывается — при мгновенном ACK эфир вообще не трогаем.
+        boolean fastPath = sendViaFastPath(msgId, message, targetDeviceId);
 
-        // Дополнительный канал: если есть сокет до получателя — дублируем туда.
-        // Принимающая сторона отсекает дубликаты по msgId, поэтому двойная
-        // доставка безопасна и заметно ускоряет обмен.
-        if (socketTransport != null) {
-            boolean sent = socketTransport.sendMessage(targetDeviceId, msgId, message);
-            if (sent) {
-                log.success("SOCKET send OK: " + msgId
-                        + (targetDeviceId != null ? " to " + targetDeviceId : " (broadcast)"));
-            }
+        corr.event(CorrelationLog.EV_MSG_SEND, msgId, targetDeviceId,
+                "slot", String.valueOf(freeSlot),
+                "fast", fastPath ? "1" : "0",
+                "len", String.valueOf(message != null ? message.length() : 0));
+
+        if (fastPath && P2pConfig.SOCKET_IS_PRIMARY_PATH) {
+            scheduleTxtFallback(freeSlot, msgId, message, targetDeviceId);
+        } else {
+            registerMessageSlot(freeSlot, msgId, message, targetDeviceId);
         }
 
         log.i("SEND MESSAGE: " + msgId + " slot=" + freeSlot +
-                (targetDeviceId != null ? " to=" + targetDeviceId : " (broadcast)"));
+                (targetDeviceId != null ? " to=" + targetDeviceId : " (broadcast)") +
+                (fastPath ? " [fast path]" : " [txt path]"));
 
         if (listener != null) {
             listener.onMessageSent(msgId, message, targetDeviceId);
         }
         return msgId;
+    }
+
+    /**
+     * Отправка быстрым путём (B1): сначала UDP внутри группы, затем TCP.
+     *
+     * <p>UDP — самый короткий путь: одна датаграмма, без сессии и без
+     * обнаружения. TCP добавлен как надёжная страховка (подтверждения и
+     * повторы). Оба канала несут один и тот же {@code msgId}, поэтому
+     * получатель отбросит второй экземпляр.
+     */
+    private boolean sendViaFastPath(String msgId, String message, String targetDeviceId) {
+        boolean sent = false;
+
+        if (groupLink != null && targetDeviceId != null && groupLink.knows(targetDeviceId)) {
+            BinaryFrame frame = Protocol.message(shortDeviceId, sessionId, msgId,
+                    message, "", System.currentTimeMillis(), P2pConfig.RELAY_TTL);
+            if (GroupLinkChannel.fitsDatagram(frame) && groupLink.send(targetDeviceId, frame)) {
+                log.success("UDP send OK: " + msgId + " to " + targetDeviceId);
+                corr.event(CorrelationLog.EV_MSG_TX, msgId, targetDeviceId,
+                        "channel", "udp-group", "bytes", String.valueOf(frame.payload.length));
+                sent = true;
+            }
+        }
+
+        if (socketTransport != null
+                && socketTransport.sendMessage(targetDeviceId, msgId, message,
+                P2pConfig.PRIORITY_NORMAL)) {
+            log.success("SOCKET send OK: " + msgId
+                    + (targetDeviceId != null ? " to " + targetDeviceId : " (broadcast)"));
+            sent = true;
+        }
+
+        return sent;
+    }
+
+    /**
+     * Отложенная публикация TXT-слота (B1).
+     *
+     * <p>Раньше сообщение всегда публиковалось в DNS-SD: это гарантировало
+     * доставку, но добавляло к каждой отправке регистрацию сервиса, обновление
+     * DNS-кэша собеседника и «мигание» записи. Теперь при живом быстром канале
+     * публикация ждёт {@link P2pConfig#TXT_FALLBACK_DELAY_MS}: если ACK пришёл
+     * быстрее — TXT не нужен вовсе.
+     */
+    private void scheduleTxtFallback(int slotIndex, String msgId, String message, String targetDeviceId) {
+        // Резервируем слот сразу, иначе следующее сообщение займёт тот же индекс
+        reservedSlots.add(slotIndex);
+
+        Runnable fallback = () -> {
+            pendingTxtFallbacks.remove(msgId);
+            if (!isRunning) {
+                reservedSlots.remove(slotIndex);
+                return;
+            }
+
+            if (isMessageAcked(msgId)) {
+                reservedSlots.remove(slotIndex);
+                log.d("TXT fallback skipped (acked): " + msgId);
+                corr.event(CorrelationLog.EV_TXT_PUB, msgId, targetDeviceId,
+                        "result", "skipped-acked");
+                return;
+            }
+
+            log.w("Fast path gave no ACK for " + msgId + " — publishing TXT slot");
+            corr.event(CorrelationLog.EV_TXT_PUB, msgId, targetDeviceId,
+                    "result", "published", "reason", "no-fast-ack");
+            reservedSlots.remove(slotIndex);
+            registerMessageSlot(slotIndex, msgId, message, targetDeviceId);
+        };
+
+        pendingTxtFallbacks.put(msgId, fallback);
+        handler.postDelayed(fallback, P2pConfig.TXT_FALLBACK_DELAY_MS);
+    }
+
+    /** Отменить отложенную публикацию TXT — сообщение уже подтверждено. */
+    private void cancelTxtFallback(String msgId) {
+        Runnable fallback = pendingTxtFallbacks.remove(msgId);
+        if (fallback != null) {
+            handler.removeCallbacks(fallback);
+            log.d("TXT fallback cancelled: " + msgId);
+        }
+        // Резерв снимаем сразу — иначе индекс «залипнет» и слотов станет меньше.
+        PendingMessage pending = pendingMessages.get(msgId);
+        if (pending != null) {
+            reservedSlots.remove(pending.slotIndex);
+        }
+    }
+
+    /** Есть ли живой быстрый канал хотя бы до кого-то. */
+    private boolean fastPathAvailable() {
+        return (socketTransport != null && socketTransport.getConnectedCount() > 0)
+                || (groupLink != null && groupLink.getKnownPeerCount() > 0);
     }
 
     /**
@@ -838,16 +1031,50 @@ public class FastDiscoveryManager {
 
             @Override
             public void onMessageReceived(String senderDeviceId, String msgId, String text) {
-                handleSocketMessage(senderDeviceId, msgId, text);
+                handleSocketMessage(senderDeviceId, msgId, text, "tcp");
             }
 
             @Override
             public void onAckReceived(String senderDeviceId, String msgId) {
                 handleSocketAck(senderDeviceId, msgId);
             }
+
+            @Override
+            public void onDelivered(String peerDeviceId, String msgId, long rttMs) {
+                // Быстрый канал подтвердил доставку — TXT-дубль не нужен (B1)
+                cancelTxtFallback(msgId);
+                corr.event(CorrelationLog.EV_MSG_TX, msgId, peerDeviceId,
+                        "channel", "tcp", "state", "delivered", "rtt_ms", String.valueOf(rttMs));
+            }
+
+            @Override
+            public void onDeliveryFailed(String peerDeviceId, String msgId) {
+                // Все быстрые попытки исчерпаны — гарантированно уходим в TXT
+                log.w("Fast delivery failed for " + msgId + " → TXT fallback");
+                Runnable fallback = pendingTxtFallbacks.get(msgId);
+                if (fallback != null) {
+                    handler.removeCallbacks(fallback);
+                    handler.post(fallback);
+                }
+            }
+
+            @Override
+            public void onRttSample(String peerDeviceId, long rttMs) {
+                linkQuality.onRttSample(peerDeviceId, rttMs);
+            }
+
+            @Override
+            public void onPeerSeen(String deviceId, String address) {
+                DiscoveredDevice dd = findDeviceByDeviceId(deviceId);
+                if (dd == null) return;
+                dd.lastSeen = System.currentTimeMillis();
+                dd.hasOurApp = true;
+            }
         });
         socketTransport.start();
-        log.success("Socket transport started on port " + P2pConfig.SOCKET_PORT);
+        log.success("Socket transport started on port " + P2pConfig.SOCKET_PORT
+                + " | primary=" + P2pConfig.SOCKET_IS_PRIMARY_PATH
+                + " | retry ladder=" + java.util.Arrays.toString(P2pConfig.RETRY_LADDER_MS));
     }
 
     private void stopSocketTransport() {
@@ -864,18 +1091,26 @@ public class FastDiscoveryManager {
      * (дедупликация по msgId, история, ACK), но без ограничения длины.
      */
     private void handleSocketMessage(String senderDeviceId, String msgId, String text) {
+        handleSocketMessage(senderDeviceId, msgId, text, "tcp");
+    }
+
+    private void handleSocketMessage(String senderDeviceId, String msgId, String text, String channel) {
         if (msgId == null || senderDeviceId == null) return;
 
         DiscoveredDevice dd = findDeviceByDeviceId(senderDeviceId);
         if (dd == null) {
             dd = createSocketOnlyDevice(senderDeviceId);
+            corr.event(CorrelationLog.EV_PEER_FOUND, null, senderDeviceId,
+                    "channel", channel);
         }
 
         dd.lastSeen = System.currentTimeMillis();
         dd.hasOurApp = true;
 
         if (!processedMessageIds.add(msgId)) {
-            // Уже принято через TXT — просто отмечаем доставку
+            // Уже принято другим каналом — фиксируем дубликат, чтобы при
+            // разборе логов было видно, какой канал пришёл первым.
+            corr.event(CorrelationLog.EV_MSG_DUP, msgId, senderDeviceId, "channel", channel);
             return;
         }
         trimSet(processedMessageIds, P2pConfig.MAX_PROCESSED_IDS);
@@ -891,17 +1126,40 @@ public class FastDiscoveryManager {
         }
         stateRepository.save();
 
-        log.success("MESSAGE VIA SOCKET: " + msgId + " from " + senderDeviceId);
+        log.success("MESSAGE VIA " + channel.toUpperCase() + ": " + msgId + " from " + senderDeviceId);
         log.i("Content: " + text);
 
-        if (listener != null && dd != null) {
-            handler.post(() -> listener.onMessageReceived(dd, msgId, text));
+        corr.event(CorrelationLog.EV_MSG_RX, msgId, senderDeviceId,
+                "channel", channel,
+                "len", String.valueOf(text != null ? text.length() : 0),
+                "rtt_ms", String.valueOf(linkQuality.srtt(senderDeviceId)));
+
+        if (listener != null) {
+            // Локальная копия: dd переприсваивалась выше, в лямбду такую
+            // переменную захватить нельзя.
+            final DiscoveredDevice device = dd;
+            final String body = text;
+            handler.post(() -> listener.onMessageReceived(device, msgId, body));
         }
 
-        // Подтверждаем сразу по сокету — это быстрее и надёжнее TXT-пути
+        // B5: подтверждаем сразу и по всем доступным каналам. Дубликаты ACK
+        // безопасны — они отсекаются на стороне отправителя.
+        boolean ackSent = false;
+        if (groupLink != null && groupLink.knows(senderDeviceId)) {
+            ackSent = groupLink.send(senderDeviceId,
+                    Protocol.ack(shortDeviceId, msgId, System.currentTimeMillis()));
+        }
         if (socketTransport != null) {
-            boolean sent = socketTransport.sendAck(senderDeviceId, msgId);
-            log.d("Socket ACK for " + msgId + ": " + (sent ? "sent" : "failed"));
+            ackSent |= socketTransport.sendAck(senderDeviceId, msgId);
+            socketTransport.queueAck(msgId);   // «попутно» — в ближайшем кадре
+        }
+
+        corr.event(CorrelationLog.EV_ACK_TX, msgId, senderDeviceId,
+                "channel", ackSent ? "fast" : "txt-fallback",
+                "sent", ackSent ? "1" : "0");
+
+        if (!ackSent) {
+            log.d("Fast ACK for " + msgId + " not sent — TXT path stays active");
         }
 
         notifyDeviceUpdated(dd);
@@ -993,10 +1251,13 @@ public class FastDiscoveryManager {
         lastGroupAttempt = now;
         log.i("Initiating P2P group with " + best.getShortId() + " (" + best.address + ")");
 
-        WifiP2pConfig config = new WifiP2pConfig();
-        config.deviceAddress = best.address;
-        config.wps.setup = WpsInfo.PBC;
-        config.groupOwnerIntent = 15;   // максимум — хотим быть владельцем группы
+        WifiP2pConfig config = buildGroupConfig(best);
+
+        corr.event(CorrelationLog.EV_GRP_UP, null, best.deviceId,
+                "state", "connecting",
+                "persistent", String.valueOf(P2pConfig.ENABLE_PERSISTENT_GROUP && HwGuard.supportsPersistentGroup()),
+                "band", String.valueOf(P2pConfig.PREFERRED_GROUP_BAND),
+                "addr", String.valueOf(best.address));
 
         manager.connect(channel, config, new WifiP2pManager.ActionListener() {
             @Override
@@ -1007,8 +1268,78 @@ public class FastDiscoveryManager {
             @Override
             public void onFailure(int reason) {
                 log.w("P2P connect failed: " + reasonToString(reason));
+                corr.event(CorrelationLog.EV_GRP_DOWN, null, best.deviceId,
+                        "state", "connect-failed", "reason", reasonToString(reason));
             }
         });
+    }
+
+    /**
+     * Конфигурация группы (A5/A6/D5).
+     *
+     * <p>С API 29 доступен {@code WifiP2pConfig.Builder}: явные SSID и пароль
+     * означают, что повторное соединение с уже знакомым телефоном проходит
+     * <b>без WPS-негоциации</b> (она и занимает основные 3–9 секунд), а
+     * {@code enablePersistentMode(true)} сохраняет группу между сессиями.
+     *
+     * <p>Имя сети строим из двух коротких ID в отсортированном порядке: обе
+     * стороны независимо получают одно и то же имя, поэтому «знакомый»
+     * телефон узнаётся с любой стороны.
+     */
+    private WifiP2pConfig buildGroupConfig(DiscoveredDevice peer) {
+        if (HwGuard.supportsPersistentGroup()) {
+            try {
+                WifiP2pConfig.Builder builder = new WifiP2pConfig.Builder()
+                        .setDeviceAddress(peer.address)
+                        .setNetworkName(groupNetworkName(peer))
+                        .setPassphrase(P2pConfig.PERSISTENT_GROUP_PASSPHRASE);
+
+                if (HwGuard.supportsBandSelection()) {
+                    builder.setGroupOperatingBand(mapOperatingBand(P2pConfig.PREFERRED_GROUP_BAND));
+                }
+                if (P2pConfig.ENABLE_PERSISTENT_GROUP) {
+                    builder.enablePersistentMode(true);
+                }
+
+                WifiP2pConfig config = builder.build();
+                config.groupOwnerIntent = 15;   // хотим быть владельцем группы
+                log.i("Group config: ssid=" + groupNetworkName(peer)
+                        + " persistent=" + P2pConfig.ENABLE_PERSISTENT_GROUP
+                        + " band=" + P2pConfig.PREFERRED_GROUP_BAND);
+                return config;
+            } catch (Exception e) {
+                // Прошивка может не поддержать Builder/пароль — падаем на PBC
+                log.w("Builder config failed (" + e.getMessage() + "), fallback to PBC");
+            }
+        }
+
+        WifiP2pConfig config = new WifiP2pConfig();
+        config.deviceAddress = peer.address;
+        config.wps.setup = WpsInfo.PBC;
+        config.groupOwnerIntent = 15;
+        return config;
+    }
+
+    /** Одинаковое имя сети на обоих телефонах: {@code DIRECT-RD-<меньший>-<больший>}. */
+    private String groupNetworkName(DiscoveredDevice peer) {
+        String other = peer.deviceId != null
+                ? CorrelationLog.shortId(peer.deviceId) : "unknown";
+        String a = shortDeviceId.compareTo(other) <= 0 ? shortDeviceId : other;
+        String b = shortDeviceId.compareTo(other) <= 0 ? other : shortDeviceId;
+        String name = P2pConfig.PERSISTENT_GROUP_PREFIX + a + "-" + b;
+        return name.length() > 32 ? name.substring(0, 32) : name;
+    }
+
+    /** Значения P2pConfig → константы {@code WifiP2pConfig}. */
+    private static int mapOperatingBand(int band) {
+        switch (band) {
+            case P2pConfig.GROUP_BAND_24:
+                return WifiP2pConfig.GROUP_OWNER_BAND_2GHZ;
+            case P2pConfig.GROUP_BAND_5:
+                return WifiP2pConfig.GROUP_OWNER_BAND_5GHZ;
+            default:
+                return WifiP2pConfig.GROUP_OWNER_BAND_AUTO;
+        }
     }
 
     /**
@@ -1035,12 +1366,155 @@ public class FastDiscoveryManager {
                         info.groupFormed, info.isGroupOwner, info.groupOwnerAddress);
             }
 
-            if (!info.groupFormed) {
-                // Группа распалась — соединения закрыты, дальше работаем по TXT
-                handler.postDelayed(FastDiscoveryManager.this::maybeInitiateGroup,
-                        P2pConfig.GROUP_RETRY_INTERVAL_MS);
+            if (info.groupFormed) {
+                // B2/B3: внутри группы уже есть IP-сеть — поднимаем UDP-канал,
+                // который не зависит от supplicant'а и даёт задержку в единицы мс.
+                startGroupLink(info);
+                corr.event(CorrelationLog.EV_GRP_UP, null, myPeerId(),
+                        "role", info.isGroupOwner ? "GO" : "client",
+                        "owner", info.groupOwnerAddress != null
+                                ? info.groupOwnerAddress.getHostAddress() : "-");
+            } else {
+                stopGroupLink();
+                corr.event(CorrelationLog.EV_GRP_DOWN, null, null, "state", "lost");
+
+                // A7: группа распалась — не ждём полминуты. Постоянная группа
+                // пересоздаётся примерно за секунду, поэтому пробуем скоро.
+                long delay = P2pConfig.ENABLE_PERSISTENT_GROUP && HwGuard.supportsPersistentGroup()
+                        ? 2_000
+                        : P2pConfig.GROUP_RETRY_INTERVAL_MS;
+                handler.postDelayed(FastDiscoveryManager.this::maybeInitiateGroup, delay);
             }
         });
+    }
+
+    // ==================== КАНАЛ ВНУТРИ ГРУППЫ (B2/B3) ====================
+
+    /**
+     * Поднять UDP-канал в подсети группы.
+     *
+     * <p>Владелец группы слушает фиксированный порт и вещает presence-маячок,
+     * клиент шлёт свои presence-пакеты на адрес владельца. Дальше сообщения
+     * идут датаграммами — без обнаружения, без DNS-SD, без TCP-сессии.
+     */
+    private void startGroupLink(WifiP2pInfo info) {
+        if (!P2pConfig.ENABLE_GROUP_LINK_CHANNEL) return;
+
+        if (groupLink == null) {
+            groupLink = new GroupLinkChannel(shortDeviceId, sessionId);
+            groupLink.setCallback(new GroupLinkChannel.Callback() {
+                @Override
+                public void onFrame(String senderDeviceId, BinaryFrame frame, String fromAddress) {
+                    handleFastFrame(senderDeviceId, frame, "udp-group");
+                }
+
+                @Override
+                public void onPeerSeen(String deviceId, String address) {
+                    DiscoveredDevice dd = findDeviceByDeviceId(deviceId);
+                    if (dd == null) {
+                        dd = createSocketOnlyDevice(deviceId);
+                        corr.event(CorrelationLog.EV_PEER_FOUND, null, deviceId,
+                                "channel", "udp-presence", "addr", address);
+                    }
+                    dd.lastSeen = System.currentTimeMillis();
+                    dd.hasOurApp = true;
+                    notifyDeviceUpdated(dd);
+                }
+
+                @Override
+                public void onRtt(String peerDeviceId, long rttMs) {
+                    linkQuality.onRttSample(peerDeviceId, rttMs);
+                    corr.event(CorrelationLog.EV_RTT, null, peerDeviceId,
+                            "channel", "udp-group", "rtt_ms", String.valueOf(rttMs));
+                }
+
+                @Override
+                public void onLinkState(boolean up, String detail) {
+                    log.i("Group link " + (up ? "up" : "down") + ": " + detail);
+                }
+            });
+        }
+
+        java.net.InetAddress local = null;
+        if (info.isGroupOwner) {
+            try {
+                local = java.net.InetAddress.getByName("192.168.49.1");   // адрес GO по умолчанию
+            } catch (Exception ignored) {
+            }
+        }
+
+        groupLink.start(info.isGroupOwner, info.groupOwnerAddress, local);
+    }
+
+    private void stopGroupLink() {
+        if (groupLink != null) {
+            groupLink.stop();
+            groupLink = null;
+        }
+    }
+
+    /**
+     * Единая обработка кадров быстрых каналов (UDP внутри группы и TCP).
+     * Здесь же ретрансляция (C6): кадр с {@code ttl > 0} пересылается дальше
+     * один раз — так досягаемость растёт без Bluetooth.
+     */
+    private void handleFastFrame(String senderDeviceId, BinaryFrame frame, String channel) {
+        switch (frame.type) {
+            case BinaryFrame.T_MSG: {
+                Protocol.Msg msg = Protocol.parseMessage(frame);
+                if (msg.deviceId == null || shortDeviceId.equals(msg.deviceId)) return;
+
+                // Оценка расхождения часов из метки отправителя
+                peerClock.observe(msg.deviceId, msg.utcMs, System.currentTimeMillis(),
+                        linkQuality.srtt(senderDeviceId));
+
+                handleSocketMessage(senderDeviceId, msg.msgId, msg.text, channel);
+                relayIfAllowed(frame, msg, senderDeviceId);
+                break;
+            }
+            case BinaryFrame.T_ACK: {
+                Protocol.Ack ack = Protocol.parseAck(frame);
+                if (ack.deviceId == null || shortDeviceId.equals(ack.deviceId)) return;
+                handleSocketAck(senderDeviceId, ack.msgId);
+                break;
+            }
+            case BinaryFrame.T_SYNC: {
+                // Диагностический кадр сверки — просто фиксируем факт
+                corr.event(CorrelationLog.EV_SYNC, null, senderDeviceId,
+                        "channel", channel, "state", "frame");
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    /**
+     * Ретрансляция кадра дальше (C6).
+     *
+     * Условия: ретрансляция включена, в кадре остался TTL, кадр ещё не
+     * пересылали (защита от лавины). Повторная доставка получателю безопасна:
+     * он отбросит дубликат по {@code msgId}.
+     */
+    private void relayIfAllowed(BinaryFrame frame, Protocol.Msg msg, String senderDeviceId) {
+        if (!P2pConfig.ENABLE_RELAY || msg.ttl <= 0) return;
+        if (!relayCache.markIfNew(msg.msgId + "@" + senderDeviceId)) return;
+
+        BinaryFrame relayed = Protocol.message(shortDeviceId, sessionId, msg.msgId,
+                msg.text, "", msg.utcMs, msg.ttl - 1);
+
+        boolean sent = false;
+        if (groupLink != null && GroupLinkChannel.fitsDatagram(relayed)) {
+            groupLink.broadcast(relayed);
+            sent = true;
+        }
+        if (socketTransport != null) {
+            socketTransport.sendFrame(null, relayed);
+            sent = true;
+        }
+
+        corr.event(CorrelationLog.EV_RELAY, msg.msgId, senderDeviceId,
+                "ttl", String.valueOf(msg.ttl - 1), "sent", sent ? "1" : "0");
     }
 
     // ==================== MAIN SERVICE ====================
@@ -1294,6 +1768,18 @@ public class FastDiscoveryManager {
     private void updateAckService() {
         if (!isRunning) return;
 
+        // D7: пока быстрый канал жив, ACK уходит по нему — отдельный DNS-SD
+        // сервис не нужен. Меньше сервисов → меньше нагрузки на supplicant,
+        // меньше шансов получить BUSY и «потерять» запись.
+        if (P2pConfig.SOCKET_IS_PRIMARY_PATH && fastPathAvailable()) {
+            if (ackServiceInfo != null) {
+                manager.removeLocalService(channel, ackServiceInfo, null);
+                ackServiceInfo = null;
+                log.d("ACK service removed: fast path is up (D7)");
+            }
+            return;
+        }
+
         Set<String> allAcks = new HashSet<>();
         for (DiscoveredDevice dd : deviceCache.values()) {
             allAcks.addAll(dd.getPendingAckMessageIds());
@@ -1385,6 +1871,19 @@ public class FastDiscoveryManager {
         record.put("t", String.valueOf(System.currentTimeMillis() / 1000));
         record.put("sid", sessionId);
 
+        // C2: Bloom-фильтр всех известных ID (32 hex-символа вместо списка).
+        // Позволяет собеседнику одной проверкой понять, есть ли у нас его
+        // сообщение, не раздувая TXT-запись.
+        BloomFilter bloom = BloomFilter.forMessageIds();
+        for (String id : mySentIds) bloom.add(id);
+        for (String id : myRecvIds) bloom.add(id);
+        record.put("bf", bloom.toHex());
+
+        corr.event(CorrelationLog.EV_SYNC, null, shortTargetId,
+                "sent", String.valueOf(mySentIds.size()),
+                "recv", String.valueOf(myRecvIds.size()),
+                "bloom_bits", String.valueOf(bloom.setBitCount()));
+
         log.i("Publishing SYNC to " + shortTargetId +
                 " | sent=" + mySentIds + " | recv=" + myRecvIds);
         fitTxtRecord(record, "Sync");
@@ -1447,6 +1946,26 @@ public class FastDiscoveryManager {
 
         log.i("SYNC received from " + senderId +
                 " | theirSent=" + theirSent + " | theirRecv=" + theirRecv);
+
+        // C2: Bloom-фильтр собеседника. «Нет» — точный ответ: сообщения у него
+        // точно нет, его можно переотправить немедленно, не дожидаясь
+        // следующего цикла сверки.
+        String theirBloomHex = record.get("bf");
+        BloomFilter theirBloom = theirBloomHex != null
+                ? BloomFilter.fromHex(theirBloomHex, P2pConfig.BLOOM_BITS) : null;
+
+        if (theirBloom != null) {
+            int missing = 0;
+            for (PendingMessage pm : pendingMessages.values()) {
+                if (theirBloom.mightContain(pm.messageId)) continue;
+                missing++;
+                log.w("SYNC: peer has no " + pm.messageId + " — will resend");
+                corr.event(CorrelationLog.EV_SYNC, pm.messageId, senderId,
+                        "state", "missing-on-peer");
+            }
+            corr.event(CorrelationLog.EV_SYNC, null, senderId,
+                    "bloom_recv", "1", "missing", String.valueOf(missing));
+        }
 
         DiscoveredDevice dd = getOrCreateDevice(device.deviceAddress, device);
 
@@ -1597,7 +2116,7 @@ public class FastDiscoveryManager {
 
     private int findFreeSlot() {
         for (int i = 0; i < P2pConfig.MAX_MSG_SLOTS; i++) {
-            if (!messageSlots.containsKey(i)) return i;
+            if (!messageSlots.containsKey(i) && !reservedSlots.contains(i)) return i;
         }
         return -1;
     }
@@ -1616,6 +2135,7 @@ public class FastDiscoveryManager {
     }
 
     private void releaseSlot(int slotIndex) {
+        reservedSlots.remove(slotIndex);
         SlotInfo slot = messageSlots.remove(slotIndex);
         if (slot != null && slot.serviceInfo != null && slot.isRegistered) {
             manager.removeLocalService(channel, slot.serviceInfo, null);
@@ -2245,6 +2765,13 @@ public class FastDiscoveryManager {
 
                 log.success("ACK received for " + ack + " from " + sender.getShortId());
 
+                // Сообщение подтверждено — TXT-путь больше не нужен (B1)
+                cancelTxtFallback(ack);
+
+                corr.event(CorrelationLog.EV_ACK_RX, ack, sender.deviceId,
+                        "channel", "txt",
+                        "batch", String.valueOf(ackBatch.size()));
+
                 sender.markSentMessageAcked(ack, ackBatch);
 
                 if (sender.deviceId != null) {
@@ -2410,28 +2937,82 @@ public class FastDiscoveryManager {
      * теряются. Здесь запросы сериализуются и троттлятся.
      */
     private void requestDiscovery(String reason) {
+        requestDiscovery(reason, false);
+    }
+
+    /**
+     * Запрос поиска с приоритетом (A1) и фазовым разделением (A2).
+     *
+     * <p>Отличие приоритетного запроса: нижняя граница интервала —
+     * {@link P2pConfig#PRIORITY_DISCOVER_GAP_MS} (800 мс) вместо 4 с. Так
+     * событийный поиск (появился пир, зарегистрирован слот, открылось окно
+     * синхронизации) срабатывает почти сразу, а не «когда-нибудь».
+     *
+     * <p>Если пиры уже известны, приоритетный проход сразу идёт в
+     * {@code discoverServices}: именно свежие TXT-записи несут сообщения и
+     * ACK, а список пиров на этом шаге уже есть. Это A2 — одна команда
+     * supplicant за проход вместо двух подряд.
+     */
+    private void requestDiscovery(String reason, boolean priority) {
         if (!isRunning || manager == null || channel == null) return;
 
         long now = System.currentTimeMillis();
         long sinceLast = now - lastDiscoverCall;
-        if (lastDiscoverCall != 0 && sinceLast < P2pConfig.MIN_DISCOVER_GAP_MS) {
+        long gap = priority ? P2pConfig.PRIORITY_DISCOVER_GAP_MS
+                : P2pConfig.MIN_DISCOVER_GAP_MS;
+
+        // D1: без включённого Location Mode discovery на MIUI/Funtouch
+        // возвращает пустой список без ошибки — фиксируем это в журнале,
+        // но попытку не отменяем (на части прошивок всё же работает).
+        if (P2pConfig.REQUIRE_LOCATION_FOR_DISCOVERY && !HwGuard.isLocationEnabled(context)) {
+            log.w("Location Mode is OFF — discovery may return an empty peer list (" + reason + ")");
+            corr.event(CorrelationLog.EV_DISC_REQ, null, null,
+                    "reason", reason, "result", "no-location");
+        }
+
+        if (lastDiscoverCall != 0 && sinceLast < gap) {
             log.d("Discovery throttled (" + reason + "), " + sinceLast + "ms since last");
+            corr.event(CorrelationLog.EV_DISC_REQ, null, null,
+                    "reason", reason, "gap_ms", String.valueOf(sinceLast),
+                    "prio", priority ? "1" : "0", "result", "throttled");
             return;
         }
+
         lastDiscoverCall = now;
         discoveryInProgress = true;
         lastDiscoveryTime = now;
-        log.d("Discovery requested: " + reason);
+        discoveryPhase++;
+
+        boolean servicesOnly = priority && !deviceCache.isEmpty();
+        log.d("Discovery requested: " + reason
+                + (priority ? " [priority]" : "")
+                + (servicesOnly ? " [services-only]" : "")
+                + " | window=" + SyncWindow.describe(now));
+
+        corr.event(CorrelationLog.EV_DISC_REQ, null, null,
+                "reason", reason,
+                "prio", priority ? "1" : "0",
+                "phase", String.valueOf(discoveryPhase),
+                "window", SyncWindow.describe(now),
+                "peers", String.valueOf(deviceCache.size()),
+                "services_only", servicesOnly ? "1" : "0");
 
         // Сторож: если колбэк discoverServices не придёт (зависший supplicant,
         // перезагрузка Wi-Fi), цикл не должен остановиться навсегда.
         handler.removeCallbacks(discoveryWatchdog);
         handler.postDelayed(discoveryWatchdog, 20_000);
 
+        if (servicesOnly) {
+            discoverServicesWithRetry(reason, 0);
+            return;
+        }
+
         manager.discoverPeers(channel, new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
                 log.d("discoverPeers started (" + reason + ")");
+                corr.event(CorrelationLog.EV_DISC_RES, null, null,
+                        "phase", "peers", "result", "ok", "reason", reason);
                 handler.postDelayed(() -> discoverServicesWithRetry(reason, 0),
                         P2pConfig.DISCOVER_SERVICES_DELAY_MS);
             }
@@ -2439,6 +3020,8 @@ public class FastDiscoveryManager {
             @Override
             public void onFailure(int r) {
                 log.w("discoverPeers failed: " + reasonToString(r) + " (" + reason + ")");
+                corr.event(CorrelationLog.EV_DISC_RES, null, null,
+                        "phase", "peers", "result", reasonToString(r), "reason", reason);
                 // peers не критичен: сразу пробуем services
                 handler.postDelayed(() -> discoverServicesWithRetry(reason, 0), 300);
             }
@@ -2458,6 +3041,9 @@ public class FastDiscoveryManager {
                 discoveryInProgress = false;
                 handler.removeCallbacks(discoveryWatchdog);
                 log.d("discoverServices started (" + reason + ", attempt " + attempt + ")");
+                corr.event(CorrelationLog.EV_DISC_RES, null, null,
+                        "phase", "services", "result", "ok",
+                        "attempt", String.valueOf(attempt), "reason", reason);
                 notifyStatus("Devices: " + deviceCache.size() + " | TXT: " + txtRecordsReceived.get());
                 scheduleNextDiscovery();
             }
@@ -2467,6 +3053,9 @@ public class FastDiscoveryManager {
                 discoveryInProgress = false;
                 log.w("discoverServices failed: " + reasonToString(r)
                         + " (" + reason + ", attempt " + attempt + ")");
+                corr.event(CorrelationLog.EV_DISC_RES, null, null,
+                        "phase", "services", "result", reasonToString(r),
+                        "attempt", String.valueOf(attempt), "reason", reason);
 
                 if (r == WifiP2pManager.BUSY && attempt < P2pConfig.DISCOVER_MAX_RETRIES) {
                     long delay = P2pConfig.DISCOVER_RETRY_BASE_MS << attempt;
@@ -2584,6 +3173,14 @@ public class FastDiscoveryManager {
         handler.postDelayed(visibilityCheckRunnable, 5000);
         handler.postDelayed(onlineCheckRunnable, P2pConfig.DEVICE_ONLINE_THRESHOLD / 2);
         handler.postDelayed(syncCheckRunnable, P2pConfig.SYNC_CHECK_INTERVAL);
+
+        // Новые быстрые циклы: окна синхронизированного поиска (A3) и дешёвый
+        // опрос списка пиров (A4). Оба не запускают сканирование сами по себе.
+        handler.removeCallbacks(syncWindowRunnable);
+        handler.removeCallbacks(peersPollRunnable);
+        handler.postDelayed(syncWindowRunnable, SyncWindow.msUntilOpen(System.currentTimeMillis()) + 50);
+        handler.postDelayed(peersPollRunnable, P2pConfig.PEERS_POLL_INTERVAL_MS);
+
         // ВАЖНО: dnsCacheResetRunnable (clearServiceRequests каждые 45 с) и
         // serviceReregisterRunnable (remove+add всех сервисов каждые 30 с)
         // намеренно НЕ планируются.
@@ -2591,8 +3188,88 @@ public class FastDiscoveryManager {
         //    входящие сообщения и ACK теряются, supplicant отвечает BUSY;
         //  - remove+add всех сервисов: окно без advertise + риск потерять
         //    указатель на зарегистрированный сервис (станция «исчезает»).
-        // Свежесть WFD_Main обеспечивает heartbeat (publishMainService каждые 5 с).
+        // Свежесть WFD_Main обеспечивает heartbeat (publishMainService каждые 5 с),
+        // это чаще требуемых 10 с (D8) — дополнительная перерегистрация не нужна.
     }
+
+    /**
+     * A3: окна синхронизированного поиска.
+     *
+     * Обе стороны считают границы окон от эпохи, поэтому окна совпадают на
+     * обоих телефонах без переговоров. В начале окна запускаем приоритетный
+     * поиск — так «встреча» происходит предсказуемо, а не через случайные
+     * 0…8 секунд.
+     */
+    private final Runnable syncWindowRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning) return;
+
+            long now = System.currentTimeMillis();
+            boolean open = SyncWindow.isOpen(now);
+
+            if (open) {
+                corr.event(CorrelationLog.EV_WINDOW, null, null,
+                        "state", "open",
+                        "phase_ms", String.valueOf(SyncWindow.phase(now)),
+                        "skew_ms", String.valueOf(peerClock.offset(myPeerId())));
+                requestDiscovery("sync-window", true);
+
+                long delay = SyncWindow.msUntilClose(now)
+                        + (P2pConfig.SYNC_WINDOW_PERIOD_MS - P2pConfig.SYNC_WINDOW_LENGTH_MS) + 50;
+                handler.postDelayed(this, delay);
+            } else {
+                handler.postDelayed(this, SyncWindow.msUntilOpen(now) + 50);
+            }
+        }
+    };
+
+    /**
+     * A4: дешёвый опрос пиров.
+     *
+     * {@code requestPeers} не запускает сканирование — это чтение уже
+     * известного supplicant'у списка, BUSY не возвращается. Позволяет
+     * заметить собеседника, которого нашёл он сам, не дожидаясь нашего
+     * discover-цикла, и обновлять lastSeen без нагрузки на радио.
+     */
+    private final Runnable peersPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning || manager == null || channel == null) return;
+
+            manager.requestPeers(channel, peers -> {
+                int count = peers.getDeviceList().size();
+                long now = System.currentTimeMillis();
+
+                for (WifiP2pDevice device : peers.getDeviceList()) {
+                    DiscoveredDevice dd = deviceCache.get(device.deviceAddress);
+                    boolean isNew = dd == null;
+                    if (isNew) {
+                        dd = getOrCreateDevice(device.deviceAddress, device);
+                    }
+                    dd.lastSeen = now;
+
+                    if (device.deviceName != null && device.deviceName.contains(P2pConfig.APP_MARKER)) {
+                        dd.hasOurApp = true;
+                        String extracted = extractDeviceIdFromName(device.deviceName);
+                        if (extracted != null && dd.deviceId == null) {
+                            bindDeviceIdentity(dd, extracted);
+                        }
+                        if (extracted != null) {
+                            corr.event(CorrelationLog.EV_PEERS, null, extracted,
+                                    "source", "requestPeers", "count", String.valueOf(count));
+                        }
+                    }
+                }
+
+                corr.event(CorrelationLog.EV_PEERS, null, null,
+                        "count", String.valueOf(count), "known", String.valueOf(deviceCache.size()));
+            });
+
+            handler.postDelayed(this, P2pConfig.PEERS_POLL_INTERVAL_MS);
+        }
+    };
+
 
     private final Runnable heartbeatRunnable = new Runnable() {
         @Override
@@ -2669,6 +3346,27 @@ public class FastDiscoveryManager {
         handler.postDelayed(discoveryRunnable, currentInterval);
     }
 
+    /**
+     * «Главный» собеседник — тот, с кем есть быстрый канал, иначе первый
+     * онлайн-пир с нашим приложением. Нужен для оценки расхождения часов и
+     * для строки диагностики; на логику доставки не влияет.
+     */
+    private String myPeerId() {
+        if (groupLink != null && groupLink.getKnownPeerCount() > 0) {
+            for (DiscoveredDevice dd : deviceCache.values()) {
+                if (dd.deviceId != null && groupLink.knows(dd.deviceId)) {
+                    return dd.deviceId;
+                }
+            }
+        }
+        for (DiscoveredDevice dd : deviceCache.values()) {
+            if (dd.hasOurApp && dd.isOnline() && dd.deviceId != null) {
+                return dd.deviceId;
+            }
+        }
+        return null;
+    }
+
     private final Runnable discoveryWatchdog = new Runnable() {
         @Override
         public void run() {
@@ -2718,6 +3416,27 @@ public class FastDiscoveryManager {
                 .append(socketTransport != null ? socketTransport.getConnectedCount() : 0)
                 .append(" | group=").append(groupFormed)
                 .append(" | GO=").append(groupOwner).append("\n");
+
+        sb.append("\n═══ FAST PATH ═══\n");
+        sb.append("Fast path primary: ").append(P2pConfig.SOCKET_IS_PRIMARY_PATH).append("\n");
+        sb.append("Group link (UDP): ")
+                .append(groupLink != null ? "ON, peers=" + groupLink.getKnownPeerCount() : "off")
+                .append("\n");
+        sb.append("TXT fallback pending: ").append(pendingTxtFallbacks.size()).append("\n");
+        sb.append("Relay cache: ").append(relayCache.size()).append("\n");
+        sb.append("Discovery window: ")
+                .append(SyncWindow.describe(System.currentTimeMillis()))
+                .append(" (period=").append(P2pConfig.SYNC_WINDOW_PERIOD_MS)
+                .append("ms, len=").append(P2pConfig.SYNC_WINDOW_LENGTH_MS).append("ms)\n");
+        String peer = myPeerId();
+        if (peer != null) {
+            sb.append("Peer ").append(CorrelationLog.shortId(peer)).append(": ")
+                    .append(linkQuality.describe(peer))
+                    .append(" | clock skew=").append(peerClock.offset(peer)).append("ms\n");
+        }
+        sb.append("Correlation log: ")
+                .append(corr.isFileAvailable() ? corr.getFile().getName() : "unavailable")
+                .append("\n");
 
         long now = System.currentTimeMillis();
         if (lastDiscoveryTime > 0) {

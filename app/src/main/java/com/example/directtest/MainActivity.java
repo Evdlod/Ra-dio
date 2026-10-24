@@ -49,6 +49,9 @@ public class MainActivity extends AppCompatActivity implements DiscoveryService.
     private TextView tvStatus;
     private Button btnStop;
 
+    /** D1: предупреждение о выключенной геолокации показываем один раз за запуск. */
+    private boolean locationWarningShown = false;
+
     // Периодическое обновление UI
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private final Runnable uiUpdateRunnable = new Runnable() {
@@ -335,7 +338,39 @@ public class MainActivity extends AppCompatActivity implements DiscoveryService.
 
     // ==================== SERVICE MANAGEMENT ====================
 
+    /**
+     * D1: проверка Location Mode перед стартом.
+     *
+     * <p>Разрешения могут быть выданы, но если режим геолокации выключен,
+     * Android не отдаёт список Wi-Fi Direct устройств: приложение «не видит»
+     * второй телефон и никакой ошибки не показывает. На MIUI/Funtouch это
+     * самая частая причина. Предупреждаем и даём кнопку в настройки.
+     */
+    private void ensureLocationModeBeforeStart() {
+        if (!P2pConfig.REQUIRE_LOCATION_FOR_DISCOVERY) return;
+        if (com.example.directtest.fast.HwGuard.isLocationEnabled(this)) return;
+        if (locationWarningShown) return;
+        locationWarningShown = true;
+
+        new AlertDialog.Builder(this)
+                .setTitle("Включите геолокацию")
+                .setMessage("Android не отдаёт список Wi-Fi Direct устройств, пока "
+                        + "выключен режим определения местоположения — даже если "
+                        + "разрешения выданы. Рация не найдёт второй телефон.\n\n"
+                        + "Включите «Геолокацию» в системных настройках.")
+                .setPositiveButton("Открыть настройки", (d, w) -> {
+                    try {
+                        com.example.directtest.fast.HwGuard.openLocationSettings(this);
+                    } catch (Exception ignored) {
+                    }
+                })
+                .setNegativeButton("Позже", null)
+                .show();
+    }
+
     private void startDiscoveryService() {
+        ensureLocationModeBeforeStart();
+
         tvStatus.setText("Starting service...");
 
         Intent intent = new Intent(this, DiscoveryService.class);

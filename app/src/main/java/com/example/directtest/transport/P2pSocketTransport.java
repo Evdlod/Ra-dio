@@ -2,61 +2,59 @@ package com.example.directtest.transport;
 
 import com.example.directtest.DiagnosticLogger;
 import com.example.directtest.P2pConfig;
+import com.example.directtest.fast.BinaryFrame;
+import com.example.directtest.fast.CorrelationLog;
+import com.example.directtest.fast.LinkQuality;
+import com.example.directtest.fast.Protocol;
 
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Дополнительный транспорт сообщений поверх P2P-группы Wi-Fi Direct.
+ * Надёжный быстрый транспорт поверх P2P-группы Wi-Fi Direct.
  *
- * Зачем: DNS-SD TXT — «хрупкий» канал передачи полезной нагрузки.
- *  - одна запись ограничена 255 байтами (кириллица — 2 байта на символ);
- *  - supplicant агрессивно кэширует TXT, обновления теряются;
- *  - любое превышение лимита приводит к молчаливому отбрасыванию записи.
+ * <h3>Что изменилось по сравнению с версией 4</h3>
+ * <ul>
+ *   <li><b>Бинарные кадры (B4)</b> вместо строк {@code WFD1|MSG|...|base64}:
+ *       без 33 %-ного раздувания, с CRC32 и длиной в байтах — кириллица
+ *       больше не упирается в лимиты, а битый поток не превращается в мусор;</li>
+ *   <li><b>Немедленный и «попутный» ACK (B5)</b>: подтверждение уходит сразу
+ *       отдельным кадром, а если в этот момент есть что отправить — ещё и
+ *       приклеивается к следующему кадру (поле {@code ack});</li>
+ *   <li><b>Лестница повторов 1→2→4→8 с (B6)</b> вместо ожидания 15 секунд:
+ *       потерянный пакет восстанавливается за секунду;</li>
+ *   <li><b>Keep-alive 5 с (B7)</b>: power-save вендорских прошивок рвёт
+ *       «молчащее» TCP-соединение; частый heartbeat держит его живым;</li>
+ *   <li><b>Адаптивные таймауты (B8)</b>: RTO считается от измеренного RTT
+ *       ({@link LinkQuality}), а не берётся из константы 60 с.</li>
+ * </ul>
  *
- * Сокеты снимают все эти ограничения: длина сообщения не ограничена,
- * доставка подтверждается явно, ретрансмиссия управляемая.
- *
- * ВАЖНО: транспорт ДОПОЛНИТЕЛЬНЫЙ. Обнаружение устройств, presence и
- * резервная доставка продолжают работать через DNS-SD. Дубликаты сообщений
- * отсекаются по msgId на принимающей стороне.
- *
- * Включается флагом {@link P2pConfig#ENABLE_P2P_SOCKET_TRANSPORT}.
+ * <p>Транспорт остаётся <i>дополнительным</i>: обнаружение и резервная
+ * доставка работают через DNS-SD, дубликаты отсекаются по {@code msgId}.
  */
 public class P2pSocketTransport {
 
     private static final String TAG = "[Sock]";
 
-    // ==================== ПРОТОКОЛ ====================
-    // Формат строки (UTF-8, разделитель — перевод строки):
-    //   WFD1|HELLO|<deviceId>|<sessionId>
-    //   WFD1|MSG|<deviceId>|<msgId>|<textBase64>
-    //   WFD1|ACK|<deviceId>|<msgId>
-    //   WFD1|HB|<deviceId>
-    // Поля не содержат '|': id — hex, текст — base64.
-
-    private static final String PROTO = "WFD1";
-    private static final String T_HELLO = "HELLO";
-    private static final String T_MSG = "MSG";
-    private static final String T_ACK = "ACK";
-    private static final String T_HB = "HB";
-
-    /**
-     * Колбэки в сторону FastDiscoveryManager.
-     */
+    /** Колбэки в сторону {@code FastDiscoveryManager}. */
     public interface Callback {
         void onPeerConnected(String deviceId);
 
@@ -65,6 +63,22 @@ public class P2pSocketTransport {
         void onMessageReceived(String senderDeviceId, String msgId, String text);
 
         void onAckReceived(String senderDeviceId, String msgId);
+
+        /** Кадр доставлен и подтверждён (для расчёта сквозной задержки). */
+        default void onDelivered(String peerDeviceId, String msgId, long rttMs) {
+        }
+
+        /** Все попытки исчерпаны — нужен резервный путь (TXT/SYNC). */
+        default void onDeliveryFailed(String peerDeviceId, String msgId) {
+        }
+
+        /** Измеренный RTT до собеседника. */
+        default void onRttSample(String peerDeviceId, long rttMs) {
+        }
+
+        /** На связи появился/пропал пир, известный только по быстрому каналу. */
+        default void onPeerSeen(String deviceId, String address) {
+        }
     }
 
     // ==================== СОСТОЯНИЕ ====================
@@ -72,49 +86,70 @@ public class P2pSocketTransport {
     private final String deviceId;
     private final String sessionId;
     private final DiagnosticLogger log = DiagnosticLogger.getInstance();
+    private final CorrelationLog corr = CorrelationLog.get();
+    private final LinkQuality quality = new LinkQuality();
 
     private final Map<String, PeerConnection> peers = new ConcurrentHashMap<>();
+    private final Map<String, PendingDelivery> awaitingAck = new ConcurrentHashMap<>();
+    private final Set<String> piggybackAcks = new LinkedHashSet<>();
+
+    private final AtomicLong pingSeq = new AtomicLong();
+    private final Map<String, Long> pendingPings = new ConcurrentHashMap<>();
 
     private volatile boolean running = false;
     private volatile ServerSocket serverSocket;
-    private volatile ExecutorService io;
+    private volatile ScheduledExecutorService scheduler;
     private volatile Callback callback;
 
     private Thread acceptThread;
-    private Thread heartbeatThread;
 
     public P2pSocketTransport(String deviceId, String sessionId) {
-        this.deviceId = deviceId;
-        this.sessionId = sessionId;
+        this.deviceId = CorrelationLog.shortId(deviceId);
+        this.sessionId = sessionId != null ? sessionId : "-";
     }
 
     public void setCallback(Callback callback) {
         this.callback = callback;
     }
 
+    public LinkQuality getLinkQuality() {
+        return quality;
+    }
+
     // ==================== LIFECYCLE ====================
 
     public synchronized void start() {
         if (running) return;
-
         running = true;
-        io = Executors.newCachedThreadPool();
 
-        acceptThread = new Thread(this::acceptLoop, "wfd-accept");
+        scheduler = Executors.newScheduledThreadPool(2, r -> {
+            Thread t = new Thread(r, "wfd-sock-sched");
+            t.setDaemon(true);
+            return t;
+        });
+
+        acceptThread = new Thread(this::acceptLoop, "wfd-sock-accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
 
-        heartbeatThread = new Thread(this::heartbeatLoop, "wfd-hb");
-        heartbeatThread.setDaemon(true);
-        heartbeatThread.start();
+        scheduler.scheduleWithFixedDelay(this::keepAliveTick,
+                P2pConfig.SOCKET_KEEPALIVE_MS, P2pConfig.SOCKET_KEEPALIVE_MS, TimeUnit.MILLISECONDS);
+        scheduler.scheduleWithFixedDelay(this::probeTick,
+                P2pConfig.RTT_PROBE_INTERVAL_MS, P2pConfig.RTT_PROBE_INTERVAL_MS, TimeUnit.MILLISECONDS);
 
-        log.i(TAG + " transport started, port=" + P2pConfig.SOCKET_PORT);
+        log.i(TAG + " transport started, port=" + P2pConfig.SOCKET_PORT
+                + ", protocol=" + P2pConfig.PROTOCOL_VERSION);
+        corr.event(CorrelationLog.EV_START, null, null,
+                "component", "socket-transport", "port", String.valueOf(P2pConfig.SOCKET_PORT));
     }
 
     public synchronized void stop() {
         if (!running) return;
-
         running = false;
+
+        ScheduledExecutorService s = scheduler;
+        scheduler = null;
+        if (s != null) s.shutdownNow();
 
         closeQuietly(serverSocket);
         serverSocket = null;
@@ -123,14 +158,12 @@ public class P2pSocketTransport {
             pc.close();
         }
         peers.clear();
-
-        ExecutorService executor = io;
-        io = null;
-        if (executor != null) {
-            executor.shutdownNow();
-        }
+        awaitingAck.clear();
+        piggybackAcks.clear();
+        pendingPings.clear();
 
         log.i(TAG + " transport stopped");
+        corr.event(CorrelationLog.EV_STOP, null, null, "component", "socket-transport");
     }
 
     public boolean isRunning() {
@@ -142,18 +175,12 @@ public class P2pSocketTransport {
     }
 
     public boolean isConnected(String targetDeviceId) {
-        return targetDeviceId != null && peers.containsKey(normalizeId(targetDeviceId));
+        return targetDeviceId != null
+                && peers.containsKey(CorrelationLog.shortId(targetDeviceId));
     }
 
     // ==================== ГРУППА ====================
 
-    /**
-     * Сообщить транспорту состояние P2P-группы.
-     *
-     * @param formed        сформирована ли группа
-     * @param groupOwner    мы ли владелец группы
-     * @param ownerAddress  адрес владельца группы (для клиента)
-     */
     public void onGroupInfo(boolean formed, boolean groupOwner, InetAddress ownerAddress) {
         if (!running) return;
 
@@ -163,6 +190,7 @@ public class P2pSocketTransport {
                 pc.close();
             }
             peers.clear();
+            awaitingAck.clear();
             return;
         }
 
@@ -178,79 +206,110 @@ public class P2pSocketTransport {
         }
     }
 
-    /**
-     * Подключиться к владельцу группы (клиентская сторона).
-     */
     public void connectToOwner(InetAddress ownerAddress) {
-        ExecutorService executor = io;
-        if (!running || ownerAddress == null || executor == null) return;
+        ScheduledExecutorService s = scheduler;
+        if (!running || ownerAddress == null || s == null) return;
 
-        // Уже есть живое соединение — повторно не лезем
         if (!peers.isEmpty()) {
             log.d(TAG + " already connected to " + peers.keySet());
             return;
         }
 
-        executor.execute(() -> {
+        s.execute(() -> {
             for (int attempt = 0; attempt < P2pConfig.SOCKET_CONNECT_ATTEMPTS && running; attempt++) {
                 try {
                     Socket socket = new Socket();
-                    socket.connect(
-                            new InetSocketAddress(ownerAddress, P2pConfig.SOCKET_PORT),
+                    socket.connect(new InetSocketAddress(ownerAddress, P2pConfig.SOCKET_PORT),
                             P2pConfig.SOCKET_CONNECT_TIMEOUT_MS);
+                    socket.setTcpNoDelay(true);
 
                     log.success(TAG + " connected to owner " + ownerAddress.getHostAddress());
+                    corr.event(CorrelationLog.EV_LINK_UP, null, null,
+                            "channel", "tcp", "addr", ownerAddress.getHostAddress(),
+                            "attempt", String.valueOf(attempt));
                     setupPeer(socket);
                     return;
                 } catch (IOException e) {
                     log.w(TAG + " connect attempt " + attempt + " failed: " + e.getMessage());
-                    sleepQuietly(1000L << attempt);
+                    sleepQuietly(LinkQuality.retryDelay(attempt));
                 }
             }
             log.error(TAG + " could not connect to owner " + ownerAddress.getHostAddress()
                     + " — remaining on DNS-SD transport");
+            corr.event(CorrelationLog.EV_LINK_DOWN, null, null,
+                    "channel", "tcp", "reason", "connect-failed");
         });
     }
 
     // ==================== ОТПРАВКА ====================
 
     /**
-     * Отправить сообщение по сокету.
-     *
-     * @param targetDeviceId ID получателя; null/пусто — всем подключённым
-     * @return true если хотя бы одному получателю отправлено
+     * Отправить сообщение. Метод возвращает true, если кадр поставлен в
+     * очередь хотя бы одного получателя: подтверждение и повторы берёт на
+     * себя транспорт.
      */
     public boolean sendMessage(String targetDeviceId, String msgId, String text) {
-        String line = encode(T_MSG, new String[]{
-                deviceId, msgId, Base64.getEncoder().encodeToString(
-                (text == null ? "" : text).getBytes(StandardCharsets.UTF_8))
-        });
-        return sendTo(targetDeviceId, line);
+        return sendMessage(targetDeviceId, msgId, text, P2pConfig.PRIORITY_NORMAL);
     }
 
-    /**
-     * Отправить подтверждение по сокету.
-     */
+    public boolean sendMessage(String targetDeviceId, String msgId, String text, int priority) {
+        if (!running || msgId == null) return false;
+
+        List<String> targets = new ArrayList<>();
+        if (targetDeviceId == null || targetDeviceId.isEmpty()) {
+            targets.addAll(peers.keySet());
+        } else {
+            String key = CorrelationLog.shortId(targetDeviceId);
+            if (peers.containsKey(key)) targets.add(key);
+        }
+        if (targets.isEmpty()) return false;
+
+        long now = System.currentTimeMillis();
+        boolean sentAny = false;
+
+        for (String peerId : targets) {
+            BinaryFrame frame = Protocol.message(deviceId, sessionId, msgId, text,
+                    takePiggybackAcks(), now, P2pConfig.RELAY_TTL);
+
+            PeerConnection pc = peers.get(peerId);
+            if (pc == null) continue;
+
+            quality.onSent(peerId);
+            pc.send(frame);
+
+            PendingDelivery delivery = new PendingDelivery(peerId, frame, msgId, now, priority);
+            awaitingAck.put(msgId + "@" + peerId, delivery);
+            scheduleRetry(delivery, 0);
+
+            corr.event(CorrelationLog.EV_MSG_TX, msgId, peerId,
+                    "channel", "tcp", "attempt", "0", "bytes", String.valueOf(frame.payload.length));
+            sentAny = true;
+        }
+        return sentAny;
+    }
+
+    /** Отправить подтверждение (немедленно, без ожидания). */
     public boolean sendAck(String targetDeviceId, String msgId) {
-        return sendTo(targetDeviceId, encode(T_ACK, new String[]{deviceId, msgId}));
+        if (msgId == null) return false;
+        return sendFrame(targetDeviceId, Protocol.ack(deviceId, msgId, System.currentTimeMillis()));
     }
 
-    private boolean sendTo(String targetDeviceId, String line) {
-        if (!running) return false;
+    /** Отправить произвольный кадр конкретному пиру или всем. */
+    public boolean sendFrame(String targetDeviceId, BinaryFrame frame) {
+        if (!running || frame == null) return false;
 
         if (targetDeviceId == null || targetDeviceId.isEmpty()) {
             boolean sent = false;
             for (PeerConnection pc : peers.values()) {
-                pc.send(line);
+                pc.send(frame);
                 sent = true;
             }
             return sent;
         }
 
-        PeerConnection pc = peers.get(normalizeId(targetDeviceId));
+        PeerConnection pc = peers.get(CorrelationLog.shortId(targetDeviceId));
         if (pc == null) return false;
-
-        pc.send(line);
+        pc.send(frame);
         return true;
     }
 
@@ -264,7 +323,6 @@ public class P2pSocketTransport {
                 server.setReuseAddress(true);
                 server.bind(new InetSocketAddress(P2pConfig.SOCKET_PORT));
                 serverSocket = server;
-
                 log.success(TAG + " listening on port " + P2pConfig.SOCKET_PORT);
 
                 while (running) {
@@ -274,30 +332,29 @@ public class P2pSocketTransport {
                 }
             } catch (IOException e) {
                 if (running) {
-                    // Порт мог быть занят при пересоздании группы — повторяем
                     log.w(TAG + " accept loop error: " + e.getMessage() + " (retry in 2s)");
                     sleepQuietly(2000);
                 }
             } finally {
                 closeQuietly(server);
-                if (serverSocket == server) {
-                    serverSocket = null;
-                }
+                if (serverSocket == server) serverSocket = null;
             }
         }
     }
 
     private void setupPeer(Socket socket) {
-        ExecutorService executor = io;
-        if (!running || executor == null) {
+        ScheduledExecutorService s = scheduler;
+        if (!running || s == null) {
             closeQuietly(socket);
             return;
         }
 
         try {
             PeerConnection pc = new PeerConnection(socket);
-            executor.execute(() -> readLoop(pc));
-            pc.send(encode(T_HELLO, new String[]{deviceId, sessionId}));
+            s.execute(() -> readLoop(pc));
+            // Рукопожатие: сразу сообщаем, кто мы, и «попутно» отдаём ACK
+            pc.send(Protocol.hello(deviceId, sessionId, System.currentTimeMillis(),
+                    takePiggybackAcks()));
         } catch (IOException e) {
             log.w(TAG + " failed to set up peer: " + e.getMessage());
             closeQuietly(socket);
@@ -306,118 +363,275 @@ public class P2pSocketTransport {
 
     private void readLoop(PeerConnection pc) {
         try {
-            String line;
-            while (running && (line = pc.readLine()) != null) {
-                handleLine(pc, line);
+            BinaryFrame frame;
+            while (running && (frame = pc.read()) != null) {
+                handleFrame(pc, frame);
             }
         } catch (IOException e) {
-            if (running) {
-                log.d(TAG + " read loop finished: " + e.getMessage());
-            }
+            if (running) log.d(TAG + " read loop finished: " + e.getMessage());
         } finally {
             pc.close();
-
             String peerId = pc.peerId;
             if (peerId != null) {
                 peers.remove(peerId, pc);
                 log.i(TAG + " peer disconnected: " + peerId);
+                corr.event(CorrelationLog.EV_LINK_DOWN, null, peerId, "channel", "tcp");
+                Callback cb = callback;
+                if (cb != null) cb.onPeerDisconnected(peerId);
+            }
+        }
+    }
+
+    private void handleFrame(PeerConnection pc, BinaryFrame frame) {
+        switch (frame.type) {
+            case BinaryFrame.T_HELLO: {
+                Protocol.Hello hello = Protocol.parseHello(frame);
+                if (hello.deviceId == null || hello.deviceId.equals(deviceId)) return;
+
+                pc.peerId = CorrelationLog.shortId(hello.deviceId);
+                peers.put(pc.peerId, pc);
+
+                if (hello.utcMs > 0) {
+                    // Оценка расхождения часов: полпути неизвестно, берём 0,
+                    // уточняется после ping/pong.
+                    // (PeerClock обновляет менеджер — он владеет общей картиной.)
+                }
+
+                log.success(TAG + " peer connected: " + pc.peerId);
+                corr.event(CorrelationLog.EV_LINK_UP, null, pc.peerId, "channel", "tcp");
                 Callback cb = callback;
                 if (cb != null) {
-                    cb.onPeerDisconnected(peerId);
+                    cb.onPeerConnected(pc.peerId);
+                    cb.onPeerSeen(pc.peerId, pc.address());
                 }
+                processPiggybackAcks(hello.ack, pc.peerId, cb);
+                break;
             }
-        }
-    }
 
-    private void handleLine(PeerConnection pc, String line) {
-        if (line == null || line.isEmpty()) return;
+            case BinaryFrame.T_MSG: {
+                Protocol.Msg msg = Protocol.parseMessage(frame);
+                if (msg.deviceId == null || msg.deviceId.equals(deviceId)) return;
 
-        String[] parts = line.split("\\|", -1);
-        if (parts.length < 3 || !PROTO.equals(parts[0])) {
-            log.w(TAG + " malformed line from " + pc.socket.getInetAddress());
-            return;
-        }
+                Callback cb = callback;
+                String sender = CorrelationLog.shortId(msg.deviceId);
+                pc.peerId = sender;
+                peers.put(sender, pc);
 
-        String type = parts[1];
-        String senderId = parts[2];
+                // B5: подтверждаем немедленно, отдельным кадром
+                pc.send(Protocol.ack(deviceId, msg.msgId, System.currentTimeMillis()));
+                corr.event(CorrelationLog.EV_MSG_RX, msg.msgId, sender,
+                        "channel", "tcp",
+                        "delay_ms", String.valueOf(System.currentTimeMillis() - msg.utcMs),
+                        "bytes", String.valueOf(msg.text != null ? msg.text.length() : 0));
 
-        // Свои же записи игнорируем
-        if (deviceId.equals(senderId)) return;
-
-        Callback cb = callback;
-
-        switch (type) {
-            case T_HELLO:
-                pc.peerId = senderId;
-                peers.put(senderId, pc);
-                log.success(TAG + " peer connected: " + senderId);
-                if (cb != null) cb.onPeerConnected(senderId);
+                if (cb != null) cb.onMessageReceived(sender, msg.msgId, msg.text);
+                processPiggybackAcks(msg.ack, sender, cb);
                 break;
+            }
 
-            case T_MSG:
-                if (parts.length < 5) return;
-                String msgId = parts[3];
-                String text = decodeText(parts[4]);
-                log.success(TAG + " MSG " + msgId + " from " + senderId);
-                if (cb != null) cb.onMessageReceived(senderId, msgId, text);
-                break;
+            case BinaryFrame.T_ACK: {
+                Protocol.Ack ack = Protocol.parseAck(frame);
+                if (ack.deviceId == null || ack.deviceId.equals(deviceId)) return;
 
-            case T_ACK:
-                if (parts.length < 4) return;
-                String ackId = parts[3];
-                log.success(TAG + " ACK " + ackId + " from " + senderId);
-                if (cb != null) cb.onAckReceived(senderId, ackId);
-                break;
-
-            case T_HB:
-                // Соединение живо — достаточно факта чтения строки
-                if (pc.peerId == null) {
-                    pc.peerId = senderId;
-                    peers.put(senderId, pc);
+                String sender = CorrelationLog.shortId(ack.deviceId);
+                PendingDelivery delivery = awaitingAck.remove(ack.msgId + "@" + sender);
+                if (delivery != null) {
+                    delivery.cancel();
+                    long rtt = System.currentTimeMillis() - delivery.sentAt;
+                    quality.onRttSample(sender, rtt);
+                    corr.event(CorrelationLog.EV_ACK_RX, ack.msgId, sender,
+                            "channel", "tcp", "rtt_ms", String.valueOf(rtt),
+                            "attempt", String.valueOf(delivery.attempt));
+                    Callback cb = callback;
+                    if (cb != null) cb.onDelivered(sender, ack.msgId, rtt);
+                } else {
+                    corr.event(CorrelationLog.EV_ACK_RX, ack.msgId, sender,
+                            "channel", "tcp", "state", "late-or-unknown");
                 }
+
+                Callback cb = callback;
+                if (cb != null) cb.onAckReceived(sender, ack.msgId);
                 break;
+            }
+
+            case BinaryFrame.T_HB: {
+                String sender = Protocol.parseHeartbeatDeviceId(frame);
+                if (sender == null || sender.equals(deviceId)) return;
+                String key = CorrelationLog.shortId(sender);
+                if (pc.peerId == null) {
+                    pc.peerId = key;
+                    peers.put(key, pc);
+                    Callback cb = callback;
+                    if (cb != null) cb.onPeerConnected(key);
+                }
+                Callback cb = callback;
+                processPiggybackAcks(parseHeartbeatAck(frame), key, cb);
+                break;
+            }
+
+            case BinaryFrame.T_PING: {
+                Protocol.Ping ping = Protocol.parsePing(frame);
+                if (ping.deviceId == null || ping.deviceId.equals(deviceId)) return;
+                pc.send(Protocol.ping(deviceId, ping.probeId, System.currentTimeMillis(),
+                        true, ping.utcMs));
+                break;
+            }
+
+            case BinaryFrame.T_PONG: {
+                Protocol.Ping pong = Protocol.parsePing(frame);
+                Long sentAt = pendingPings.remove(pong.probeId);
+                if (sentAt == null) return;
+                long rtt = Math.max(0, System.currentTimeMillis() - sentAt);
+                String peer = CorrelationLog.shortId(pong.deviceId);
+                quality.onRttSample(peer, rtt);
+                corr.event(CorrelationLog.EV_RTT, null, peer,
+                        "channel", "tcp", "rtt_ms", String.valueOf(rtt),
+                        "skew_ms", String.valueOf(pong.utcMs - pong.echoUtcMs - rtt / 2));
+                Callback cb = callback;
+                if (cb != null) cb.onRttSample(peer, rtt);
+                break;
+            }
 
             default:
-                log.d(TAG + " unknown message type: " + type);
+                log.d(TAG + " unknown frame type: " + frame.type);
                 break;
         }
     }
 
-    // ==================== HEARTBEAT ====================
+    private static String parseHeartbeatAck(BinaryFrame frame) {
+        BinaryFrame.Reader r = new BinaryFrame.Reader(frame.payload);
+        r.getString();   // deviceId
+        r.getLong();     // utc
+        return r.getString();
+    }
 
-    private void heartbeatLoop() {
-        while (running) {
-            sleepQuietly(P2pConfig.SOCKET_HB_INTERVAL_MS);
-            if (!running) return;
+    private void processPiggybackAcks(String acks, String peer, Callback cb) {
+        for (String msgId : Protocol.splitAcks(acks)) {
+            corr.event(CorrelationLog.EV_ACK_RX, msgId, peer, "channel", "tcp-piggyback");
+            if (cb != null) cb.onAckReceived(peer, msgId);
+        }
+    }
 
-            String line = encode(T_HB, new String[]{deviceId});
-            for (PeerConnection pc : peers.values()) {
-                pc.send(line);
+    // ==================== ПОВТОРЫ И ACK ====================
+
+    private final class PendingDelivery {
+        final String peerId;
+        final BinaryFrame frame;
+        final String msgId;
+        final long sentAt;
+        final int priority;
+        int attempt;
+        volatile ScheduledFuture<?> future;
+
+        PendingDelivery(String peerId, BinaryFrame frame, String msgId, long sentAt, int priority) {
+            this.peerId = peerId;
+            this.frame = frame;
+            this.msgId = msgId;
+            this.sentAt = sentAt;
+            this.priority = priority;
+        }
+
+        void cancel() {
+            ScheduledFuture<?> f = future;
+            if (f != null) f.cancel(false);
+        }
+    }
+
+    private void scheduleRetry(PendingDelivery delivery, int attempt) {
+        ScheduledExecutorService s = scheduler;
+        if (s == null || !running) return;
+
+        long delay = LinkQuality.retryDelay(attempt);
+        delivery.attempt = attempt;
+
+        try {
+            delivery.future = s.schedule(() -> {
+                if (!running) return;
+
+                String key = delivery.msgId + "@" + delivery.peerId;
+                if (!awaitingAck.containsKey(key)) return;   // уже подтверждено
+
+                if (attempt >= P2pConfig.RETRY_LADDER_MS.length) {
+                    awaitingAck.remove(key);
+                    quality.onLost(delivery.peerId);
+                    log.w(TAG + " delivery failed after " + attempt + " retries: " + delivery.msgId);
+                    corr.event(CorrelationLog.EV_RETRY, delivery.msgId, delivery.peerId,
+                            "channel", "tcp", "attempt", String.valueOf(attempt), "result", "give-up");
+                    Callback cb = callback;
+                    if (cb != null) cb.onDeliveryFailed(delivery.peerId, delivery.msgId);
+                    return;
+                }
+
+                PeerConnection pc = peers.get(delivery.peerId);
+                if (pc == null) {
+                    awaitingAck.remove(key);
+                    Callback cb = callback;
+                    if (cb != null) cb.onDeliveryFailed(delivery.peerId, delivery.msgId);
+                    return;
+                }
+
+                pc.send(delivery.frame);
+                corr.event(CorrelationLog.EV_RETRY, delivery.msgId, delivery.peerId,
+                        "channel", "tcp", "attempt", String.valueOf(attempt + 1),
+                        "delay_ms", String.valueOf(delay));
+                scheduleRetry(delivery, attempt + 1);
+            }, delay, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            log.w(TAG + " cannot schedule retry: " + e.getMessage());
+        }
+    }
+
+    /** Взять до {@code MAX_ACKS_PER_RECORD} подтверждений для «попутной» отправки. */
+    private String takePiggybackAcks() {
+        synchronized (piggybackAcks) {
+            if (piggybackAcks.isEmpty()) return "";
+            StringBuilder sb = new StringBuilder();
+            int count = 0;
+            List<String> taken = new ArrayList<>();
+            for (String msgId : piggybackAcks) {
+                if (count++ >= P2pConfig.MAX_ACKS_PER_RECORD) break;
+                if (sb.length() > 0) sb.append(',');
+                sb.append(msgId);
+                taken.add(msgId);
+            }
+            piggybackAcks.removeAll(taken);
+            return sb.toString();
+        }
+    }
+
+    /** Поставить ACK в очередь «попутной» отправки (B5). */
+    public void queueAck(String msgId) {
+        if (msgId == null) return;
+        synchronized (piggybackAcks) {
+            piggybackAcks.add(msgId);
+        }
+    }
+
+    // ==================== KEEP-ALIVE И PROBE ====================
+
+    private void keepAliveTick() {
+        if (!running) return;
+        String acks = takePiggybackAcks();
+        BinaryFrame hb = Protocol.heartbeat(deviceId, System.currentTimeMillis(), acks);
+        for (PeerConnection pc : peers.values()) {
+            pc.send(hb);
+        }
+    }
+
+    private void probeTick() {
+        if (!running || peers.isEmpty()) return;
+        for (String peer : peers.keySet()) {
+            String probeId = deviceId + "t" + pingSeq.incrementAndGet();
+            pendingPings.put(probeId, System.currentTimeMillis());
+            PeerConnection pc = peers.get(peer);
+            if (pc != null) {
+                pc.send(Protocol.ping(deviceId, probeId, System.currentTimeMillis(), false, 0));
             }
         }
-    }
-
-    // ==================== КОДИРОВАНИЕ ====================
-
-    private static String encode(String type, String[] fields) {
-        StringBuilder sb = new StringBuilder(PROTO).append('|').append(type);
-        for (String field : fields) {
-            sb.append('|').append(field == null ? "" : field);
+        // Не даём карте пингов расти, если ответы не приходят
+        if (pendingPings.size() > 64) {
+            pendingPings.clear();
         }
-        return sb.toString();
-    }
-
-    private static String decodeText(String base64) {
-        try {
-            return new String(Base64.getDecoder().decode(base64), StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            return "";
-        }
-    }
-
-    private static String normalizeId(String deviceId) {
-        if (deviceId == null) return "";
-        return deviceId.length() > 8 ? deviceId.substring(0, 8) : deviceId;
     }
 
     // ==================== ВСПОМОГАТЕЛЬНОЕ ====================
@@ -446,39 +660,39 @@ public class P2pSocketTransport {
         }
     }
 
-    /**
-     * Одно TCP-соединение с собеседником.
-     */
+    /** Одно TCP-соединение с собеседником. */
     private final class PeerConnection {
 
         private final Socket socket;
-        private final BufferedReader in;
-        private final BufferedWriter out;
+        private final InputStream in;
+        private final OutputStream out;
+        private final Object sendLock = new Object();
 
         volatile String peerId;
         private volatile boolean closed;
 
         PeerConnection(Socket socket) throws IOException {
             this.socket = socket;
-            this.socket.setSoTimeout(P2pConfig.SOCKET_READ_TIMEOUT_MS);
+            this.socket.setSoTimeout((int) P2pConfig.SOCKET_READ_TIMEOUT_MS);
             this.socket.setTcpNoDelay(true);
-            this.in = new BufferedReader(
-                    new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            this.out = new BufferedWriter(
-                    new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+            this.in = new BufferedInputStream(socket.getInputStream());
+            this.out = new BufferedOutputStream(socket.getOutputStream());
         }
 
-        String readLine() throws IOException {
-            return in.readLine();
+        String address() {
+            return socket.getInetAddress() != null
+                    ? socket.getInetAddress().getHostAddress() : "-";
         }
 
-        void send(String line) {
-            if (closed) return;
+        BinaryFrame read() throws IOException {
+            return BinaryFrame.read(in);
+        }
+
+        void send(BinaryFrame frame) {
+            if (closed || frame == null) return;
             try {
-                synchronized (this) {
-                    out.write(line);
-                    out.write('\n');
-                    out.flush();
+                synchronized (sendLock) {
+                    BinaryFrame.write(out, frame);
                 }
             } catch (IOException e) {
                 log.w(TAG + " send failed (" + (peerId != null ? peerId : "unknown")

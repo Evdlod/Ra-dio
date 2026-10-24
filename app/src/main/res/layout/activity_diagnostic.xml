@@ -39,6 +39,15 @@
             android:textSize="12sp" />
 
         <Button
+            android:id="@+id/btn_export_corr"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="4dp"
+            android:text="Файлы"
+            android:textSize="12sp" />
+
+        <Button
             android:id="@+id/btn_back"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
