@@ -1,0 +1,462 @@
+# Почему «на некоторых телефонах» плохо работает приём и передача
+
+Аудит кода `WiFi Direct Text Transceiver` (ветка `arena/27e3fc29-ra-dio`, коммит `c0e2fe7`).
+Все ссылки — на файл `app/src/main/java/com/example/directtest/FastDiscoveryManager.java`, если не указано иное.
+
+Главный вывод: **приём и передача идут исключительно через DNS-SD TXT-записи**, а это самый «хрупкий» транспорт из возможных. У него есть жёсткие лимиты по размеру, агрессивное кэширование в supplicant и очень разное поведение на разных вендорских прошивках. Поэтому половина ошибок ниже проявляется не «у всех», а именно **на части телефонов** — тех, где стек Wi-Fi строже проверяет лимиты, где включена рандомизация MAC, где агерссивный менеджер батареи, где сбиты часы.
+
+---
+
+## 0. TL;DR — что чинить в первую очередь
+
+| # | Ошибка | Симптом | Приоритет |
+|---|--------|---------|-----------|
+| 1 | TXT-запись превышает 255 байт (кириллица = 2 байта/символ) | сообщение не доходит, ошибок в логе нет | 🔴 P0 |
+| 2 | Возраст сообщения и «свежесть» сессии считаются по **чужим часам** | телефон-с-неверным-временем полностью глухой | 🔴 P0 |
+| 3 | `clearAll()` навсегда убивает цикл discovery | после кнопки «Очистить» больше ничего не находит | 🔴 P0 |
+| 4 | 4 независимых цикла `discoverPeers/discoverServices` → `BUSY` | то находит, то нет; «залипает» до перезапуска | 🔴 P0 |
+| 5 | `removeLocalService`+`addLocalService` каждые 5 с без ретраев | станция периодически «исчезает» из эфира навсегда | 🔴 P0 |
+| 6 | `resendMessage()` не кладёт сообщение в `pendingMessages` | ACK на переотправку игнорируется → бесконечный RESEND | 🟠 P1 |
+| 7 | ACK принимается только для **текущей** sessionId | после перезапуска приложения сообщения «вечно не доставлены» | 🟠 P1 |
+| 8 | `buildAckString()` меняет состояние как побочный эффект | ACK «съедаются» записью, которая не публикуется | 🟠 P1 |
+| 9 | «ACK доставлен» выставляется по таймауту 10 с, а не по факту | отправитель ждёт ACK, который уже никто не шлёт | 🟠 P1 |
+| 10 | Дедупликация TXT гасит повторы → ACK не обновляется | ACK отправляется один раз, потеря = тупик до SYNC (60 с) | 🟠 P1 |
+| 11 | Ключ кэша и репозитория — **MAC**, а он рандомизируется/анонимизируется | дубли устройств, потеря истории, отправка «не тому» | 🟠 P1 |
+| 12 | `setDeviceName` через рефлексию (не-SDK API) | маркер `[WFD]` не ставится на Android 9+ → позже определяется «своё» приложение | 🟡 P2 |
+| 13 | `WIFI_MODE_FULL_HIGH_PERF` устарел (API 29+), результат не проверяется | экран погас → часть вендоров усыпляет P2P | 🟡 P2 |
+| 14 | Нет проверки «Wi-Fi включён» и нет восстановления при `WIFI_P2P_STATE_CHANGED` | включил Wi-Fi обратно — приём не вернулся | 🟡 P2 |
+| 15 | Нет запроса исключения из battery optimization; `onTaskRemoved` игнорируется | на Xiaomi/Huawei/Samsung сервис убивают в фоне | 🟡 P2 |
+| 16 | `DiagnosticLogger`/UI: мелочи, NPE-риски, hardcode лимита 3 | падения/рассинхрон UI | ⚪ P3 |
+
+---
+
+## Часть A. Почему именно «на некоторых телефонах»
+
+### A1. 🔴 TXT-запись физически не влезает в лимит DNS-SD (и это зависит от языка)
+
+DNS-SD TXT — это набор строк `key=value`, каждая не длиннее **255 байт**; DNS-SD прямо рекомендует держать **весь** TXT ≤ 200 байт. Android для Wi-Fi Direct передаёт TXT как один бинарный блок, поэтому практический лимит — **~255 байт на всю запись**. Часть стеков при превышении молча обрезает/отбрасывает запись, часть возвращает `ERROR` в `addLocalService`.
+
+Код ограничивает сообщение **символами**, а не байтами:
+
+* `P2pConfig.MAX_MESSAGE_LENGTH = 100` (`P2pConfig.java:63`)
+* `record.put("msg", truncateMessage(message, P2pConfig.MAX_MESSAGE_LENGTH))` — строка `1132`
+
+Расчёт реального размера записи слота (`id`, `mid`, `msg`, `s`, `t`, `sid`, `to`):
+
+| Длина текста | Латиница | Кириллица |
+|---|---|---|
+| 20 симв. | 104 B | 124 B |
+| 40 симв. | 124 B | 164 B |
+| 60 симв. | 144 B | 204 B |
+| **80 симв.** | 164 B | **244 B** ⚠️ |
+| **100 симв.** | 184 B | **284 B** ❌ превышение |
+
+Ключевые детали:
+
+* кириллица в UTF-8 — 2 байта на символ, эмодзи — 4;
+* к записи слота добавляется ещё и `ack` (до 5 msgId ≈ 100 байт, см. `MAX_ACKS_PER_RECORD = 5`, строка `1141`) → **даже короткое сообщение уходит за лимит, если в этот момент есть неподтверждённые ACK**;
+* `WFD_Main` с 5 ACK — 152 B, `WFD_Sync` с 3+3 msgId — 180 B: ещё влезают, но без запаса;
+* msgId в коде длиннее, чем в README (`shortId_sessionId_counter` = 18–20 байт против `a1b2_695b_1`), так что бюджет съедается быстрее.
+
+Итог: **русский текст длиннее ~80 символов (или ~55 при наличии ACK) гарантированно не доставляется на строгих стеках** — при этом ни исключения, ни записи в лог об ошибке нет. Это ровно тот случай, когда «на одном телефоне работает, на другом нет» — и «кириллица не работает, латиница работает».
+
+**Патч.** Считать байты, а не символы, и проверять бюджет всей записи:
+
+```java
+private static final int TXT_BUDGET_BYTES = 240; // < 255 с запасом на разделители
+
+private static int utf8Len(String s) {
+    return s == null ? 0 : s.getBytes(StandardCharsets.UTF_8).length;
+}
+
+private String truncateUtf8(String s, int maxBytes) {
+    if (s == null) return "";
+    String out = s;
+    while (utf8Len(out) > maxBytes && out.length() > 0) {
+        out = out.substring(0, out.length() - 1);
+    }
+    return out;
+}
+
+/** Подгоняет запись под лимит: сначала режет msg, потом ack. */
+private Map<String, String> fitTxtRecord(Map<String, String> record) {
+    int size = 0;
+    for (Map.Entry<String, String> e : record.entrySet()) {
+        size += utf8Len(e.getKey() + "=" + e.getValue()) + 1; // +1 байт длины строки
+    }
+    while (size > TXT_BUDGET_BYTES && record.containsKey("ack")) {
+        String ack = record.remove("ack");
+        // пробуем без ack; если всё равно много — режем текст
+        size = 0;
+        for (Map.Entry<String, String> e : record.entrySet()) {
+            size += utf8Len(e.getKey() + "=" + e.getValue()) + 1;
+        }
+        if (size <= TXT_BUDGET_BYTES) break;
+        if (ack.isEmpty()) break;
+    }
+    if (size > TXT_BUDGET_BYTES) {
+        String msg = record.get("msg");
+        int over = size - TXT_BUDGET_BYTES;
+        record.put("msg", truncateUtf8(msg, Math.max(0, utf8Len(msg) - over)));
+    }
+    return record;
+}
+```
+
+и в `registerMessageSlot()` (строка `1132`) заменить `truncateMessage(...)` на `fitTxtRecord(record)`, **плюс обязательно логировать**, когда текст урезан: пользователь должен видеть причину.
+
+Дополнительно, стратегически: 100 символов в одной TXT — плохая идея в принципе. Правильнее либо (а) снизить лимит до 30–40 байт, либо (б) разбивать текст на 2–3 TXT-записи (`msg0`, `msg1`, `msg2` — это как раз ваши свободные слоты), либо (в) уйти на сокеты (см. Часть E).
+
+---
+
+### A2. 🔴 Приём зависит от часов собеседника
+
+Два места доверяют чужому `System.currentTimeMillis()`:
+
+1. **Возраст сообщения** — строки `1380–1391`:
+   ```java
+   long ageSec = nowSec - msgTsSec;
+   if (ageSec > P2pConfig.MAX_MSG_AGE_SEC) { log.w("Ignoring old message slot ..."); return; }
+   ```
+   `MAX_MSG_AGE_SEC = 120`. Если на телефоне B часы убежали вперёд на 3 минуты (типично сразу после загрузки, до синхронизации времени, или при ручной установке), то **все** его сообщения для A выглядят «старыми» и молча отбрасываются. Приём отсутствует полностью, отправитель видит вечное «⏳ waiting ACK».
+
+2. **Свежесть сессии** — `isNewerSessionId()` (строка `233`) и `validateSessionId()` (строка `255`):
+   ```java
+   long newTs = Long.parseLong(newSid, 16);   // это секунды старта приложения
+   return newTs > oldTs;
+   ```
+   Если часы откатились назад (авто-время ещё не пришло, ручная установка, сброс), новая сессия собеседника считается «старой» → `validateSessionId` возвращает `false` → **все записи этого устройства игнорируются**, оно не появляется в эфире вообще. А обратный эффект: любое «убегание вперёд» трактуется как «устройство перезапустилось» → `clearHistory()` + `state.clearMessages()` (строки `286–296`) → **история и неотправленные сообщения стираются**.
+
+**Патч.** Не использовать абсолютное время между устройствами:
+
+* возраст: либо не проверять вовсе (дубликаты и так отсекаются по `mid`), либо разрешить допуск и обе стороны: `if (ageSec > MAX_MSG_AGE_SEC && msgTsSec < ownBootTimestamp)` — сравнивать только с *своим* временем, а чужой `t` использовать лишь для отображения;
+* сессии: хранить у себя монотонный счётчик `sessionCounter` (инкремент в SharedPreferences при каждом старте) и слать его вместо hex-времени, либо не стирать историю по «более новой» сессии, а только помечать записи.
+
+---
+
+### A3. 🔴 Кнопка «Очистить» навсегда останавливает поиск
+
+`clearAll()` — строка `431`; внутри:
+
+```java
+handler.removeCallbacksAndMessages(null);   // строка 434 — убивает ВСЁ, включая discoveryRunnable и burst-цепочку
+...
+schedulePeriodicTasks();                    // строка 486 — а вот discovery никто не переподписал
+```
+
+`schedulePeriodicTasks()` поднимает только heartbeat/ack/visibility/online/sync/dns-reset. `discoverPeers`/`discoverServices` больше **никогда** не вызываются → устройство перестаёт «слышать» эфир до перезапуска сервиса. Пользователь при этом видит «Cleared. Devices: 0» и думает, что «рация сломалась на этом телефоне».
+
+**Патч** — после очистки перезапустить цикл поиска:
+
+```java
+burstCount = 0;
+initialBurstPhase = true;
+handler.postDelayed(this::performBurstStep, P2pConfig.INITIAL_BURST_INTERVAL);
+scheduleNextDiscovery();
+```
+(и вызвать `registerMainService`/`addServiceRequests`, если они тоже были снесены).
+
+---
+
+### A4. 🔴 Гонка запросов discovery → `BUSY` и «залипание»
+
+`discoverPeers`/`discoverServices` в Android — асинхронные команды в supplicant; повторный вызов во время активного поиска возвращает `BUSY` (а на части прошивок ещё и **прерывает** текущий поиск, из-за чего результаты теряются). В коде одновременно работают:
+
+| Место | Что вызывает | Период |
+|---|---|---|
+| `startDiscoverySequence()` (`727–728`) | peers + services | при старте |
+| `performBurstStep()` (`1617–1620`) | peers + services | 200 / 400 мс серией |
+| `performDiscovery()` (`1848–1861`) | peers + services | 3–8 с, **постоянно** |
+| `onBurstComplete()` → `scheduleNextDiscovery()` | запускает второй цикл поверх burst | — |
+| `handleBroadcast` при `PEERS_CHANGED` (`2070`) | services | на каждое событие |
+| `registerMessageSlot().onSuccess` (`1162`) | services | на каждое сообщение |
+| `resetServiceRequests()` (`1555`) | `clearServiceRequests` + 3 запроса + services | каждые 45 с |
+| `MainActivity.onServiceConnected` → `forceRefresh()` (`MainActivity.java:73`) | `stopPeerDiscovery` + `clearServiceRequests` + перерегистрация | **при каждом входе в приложение / повороте экрана** |
+
+Следствия, которые видны именно на «строгих» стеках (Samsung, Xiaomi, Huawei, часть Pixel):
+
+* `discoverServices failed: BUSY` в логах пачками;
+* `clearServiceRequests()` каждые 45 секунд и `forceRefresh()` при открытии Activity **рвут уже найденные сервисы**: пока запросы не добавлены заново, TXT не приходят — входящие сообщения теряются, а если в этот момент отправитель ждал ACK, ACK не уйдёт;
+* после «залипания» в `BUSY` восстановления нет — только перезапуск.
+
+**Патч.** Один планировщик и сериализация:
+
+```java
+private volatile long lastDiscoverCall = 0;
+private static final long MIN_DISCOVER_GAP = 8_000; // supplicant не любит чаще
+
+private void requestDiscovery(boolean withPeers) {
+    long now = System.currentTimeMillis();
+    if (now - lastDiscoverCall < MIN_DISCOVER_GAP) return;   // дешёвый троттлинг
+    lastDiscoverCall = now;
+    if (withPeers) manager.discoverPeers(channel, listenerWithBackoff());
+    handler.postDelayed(() -> manager.discoverServices(channel, listenerWithBackoff()), 150);
+}
+```
+
+* убрать burst-цепочку или оставить только её на старте (первые 3 с), а `performDiscovery` — единственный периодический источник;
+* `forceRefresh()` не должен вызывать `stopPeerDiscovery()`/`clearServiceRequests()` — достаточно `discoverServices`;
+* `resetServiceRequests()` (45 с) лучше отключить совсем: побочный эффект (потеря регистрации) дороже пользы;
+* на `BUSY` — повтор с экспоненциальной паузой (2→4→8 с), а не через 500 мс (сейчас `1866`: мгновенный повтор в `BUSY` гарантированно получает `BUSY` снова).
+
+---
+
+### A5. 🔴 Heartbeat перерегистрируется через `remove`+`add` каждые 5 секунд
+
+`updateMainService()` (`818–852`) каждые 5 с удаляет локальный сервис и добавляет новый. Между вызовами есть окно, когда станция **не advertise** — собеседник в этот момент видит её «молчащей». Хуже: при `onFailure` от `removeLocalService` код всё равно делает `addLocalService(channel, newInfo, null)` **без обработчика**, а `mainServiceInfo = newInfo` присваивается независимо от результата (строки `843`, `848`). Если добавление не удалось (`BUSY`/`ERROR`), то:
+
+* новый сервис не опубликован;
+* `mainServiceInfo` указывает на «фантом» — следующий `removeLocalService` не найдёт его, и в итоге **станция пропадает из эфира навсегда**, при этом heartbeat-счётчик продолжает расти и в логах всё «ОК».
+
+Это классический источник «на одном телефоне пропала и не вернулась».
+
+Плюс мёртвый код: `reregisterAllServices()` (`1657`) и `serviceReregisterRunnable` (`1771`) **отключены** (строки `1751`, `1759` закомментированы), т.е. перерегистрация слотов сообщений для обновления DNS-кэша не работает совсем. А именно она нужна, когда TXT-кэш собеседника устарел (типично после сна).
+
+**Патч.**
+
+```java
+private void registerMain(Map<String, String> record, int attempt) {
+    WifiP2pDnsSdServiceInfo info = WifiP2pDnsSdServiceInfo.newInstance(
+            P2pConfig.MAIN_SERVICE_NAME, P2pConfig.SERVICE_TYPE, fitTxtRecord(record));
+    manager.addLocalService(channel, info, new WifiP2pManager.ActionListener() {
+        @Override public void onSuccess() { mainServiceInfo = info; }   // присваиваем ТОЛЬКО при успехе
+        @Override public void onFailure(int r) {
+            log.w("main add failed: " + reasonToString(r) + " attempt=" + attempt);
+            if (attempt < 4) handler.postDelayed(() -> registerMain(record, attempt + 1), 1000L << attempt);
+        }
+    });
+}
+```
+
+и вместо `remove`+`add` в цикле: обновлять main только когда изменился контент (ACK-набор или `hb`), не чаще 5 с, с проверкой «предыдущий add ещё в полёте». Для heartbeat-полей лучше отдельный сервис `WFD_Hb`, чтобы главный не трогать вовсе.
+
+---
+
+## Часть B. Логические ошибки протокола (ломают всех, но на плохом канале — фатально)
+
+### B1. 🟠 Переотправленное сообщение не может получить ACK
+
+`resendMessage()` — строка `1085`:
+
+```java
+private void resendMessage(String targetDeviceId, String msgId, String text) {
+    int slot = findFreeSlot();
+    if (slot < 0) slot = releaseOldestSlot();
+    registerMessageSlot(slot, msgId, text, targetDeviceId);   // pendingMessages.put(...) НЕТ
+}
+```
+
+А обработка ACK ищет сообщение именно в `pendingMessages` и при `null` просто пропускает (`1455–1462`):
+
+```java
+PendingMessage pm = pendingMessages.get(ack);
+if (pm == null) { continue; }   // ACK отбрасывается
+```
+
+Итог: любое сообщение, попавшее в RESEND (по SYNC), **не может быть подтверждено**. Оно висит, слот истекает, SYNC через ~60 с снова его переотправляет — и так по кругу: бесконечная переотправка, забитые слоты, «передача не работает».
+
+**Патч:**
+
+```java
+private void resendMessage(String targetDeviceId, String msgId, String text) {
+    int slot = findFreeSlot();
+    if (slot < 0) slot = releaseOldestSlot();
+    pendingMessages.put(msgId, new PendingMessage(msgId, text, targetDeviceId, slot)); // +
+    log.i("RESENDING " + msgId + " to=" + targetDeviceId + " slot=" + slot);
+    registerMessageSlot(slot, msgId, text, targetDeviceId);
+}
+```
+
+### B2. 🟠 ACK отбрасывается после перезапуска приложения
+
+Проверка «это ACK за наше сообщение» (строки `1004`, `1448`):
+
+```java
+if (ack.startsWith(shortDeviceId + "_" + sessionId + "_")) { ... }
+```
+
+`sessionId` — новый при каждом старте приложения (`generateSessionId()`, строка `221`, hex от времени). А в репозитории хранятся до 3 отправленных сообщений **прошлых** сессий (`DeviceState.MAX_MESSAGES = 3`), и SYNC их честно переотправляет (`SyncManager.processIncomingSync` → `onResendMessage`). Получатель их принимает, шлёт ACK со старым `mid` — и отправитель его **игнорирует**, потому что префикс не совпадает. Дальше — см. B1: вечный цикл.
+
+**Патч:** проверять принадлежность только по `shortDeviceId` (и существованию записи), а не по текущей сессии:
+
+```java
+if (!ack.startsWith(shortDeviceId + "_")) continue;         // наш ли это ID вообще
+PendingMessage pm = pendingMessages.get(ack);
+if (pm == null && !stateRepositoryHasSent(ack)) continue;    // или уже доставлено
+```
+
+Либо (чище): при старте вычищать из репозитория `sentMessages` прошлых сессий с флагом «не доставлено», чтобы SYNC не пытался их спасти.
+
+### B3. 🟠 `buildAckString()` — скрытый побочный эффект
+
+Строки `798–815`: метод не просто собирает строку, он **помечает ACK отправленными** (`dd.markReceivedMessageAckSent`) и наполняет `pendingAcksToSend`. Вызывается из:
+
+* `buildMainServiceRecord()` → `790` (heartbeat и перерегистрации);
+* `registerMessageSlot()` → `1141` (запись может быть отброшена по лимиту размера — см. A1, или `addLocalService` вернёт `ERROR`);
+* `reregisterMainService()` (через `buildMainServiceRecord`).
+
+Т.е. ACK считается «отправленным» в момент **формирования** записи, даже если она никогда не ушла в эфир. Счётчик `ackSendCount` растёт, а доставки нет. Плюс жёсткий лимит `MAX_ACKS_PER_RECORD = 5` и обход `deviceCache` по порядку: ACK для «последнего» устройства может не попасть в эфир никогда, если первые устройства постоянно занимают лимит.
+
+**Патч:** разделить «собрать» и «подтвердить отправку»: собирать без мутаций, а `markReceivedMessageAckSent` вызывать в `onSuccess()` у `addLocalService` (или в heartbeat через 1 тик после успешной публикации). И сделать очередь ACK честной: round-robin, лимит не «первые 5 из HashMap», а те, что ждут дольше всех.
+
+### B4. 🟠 «Доставлено» выставляется по таймауту, а не по ACK
+
+`checkMessageVisibility()` — строки `1517–1543`:
+
+```java
+Long lastSeen = activeIncomingMessages.get(msgId);
+if (lastSeen == null || now - lastSeen > timeout) {      // timeout = 10_000
+    dd.markReceivedMessageAckConfirmed(msgId);           // «доставлено!»
+    pendingAcksToSend.remove(msgId);
+}
+```
+
+«Доставлено» здесь означает всего лишь «запись слота перестала приходить в течение 10 секунд». Причины могут быть разные: собеседник ушёл в сон, supplicant выкинул его из кэша, остановился discovery (см. A3/A4) — а получатель решает, что всё хорошо, и **перестаёт слать ACK**. Отправитель в это время показывает вечное «⏳». Логика двух сторон расходится.
+
+Дополнительно: `activeIncomingMessages` обновляется только в `handleMessageSlotRecord` (`1394`), но **после** фильтра дедупликации (`1277`), а запись слота статична (в ней не меняется ни `mid`, ни `msg`, ни `t`) → повторные приходы той же записи в пределах 2 с отбрасываются, а поскольку запись больше не меняется, то через 10 с она гарантированно «протухает».
+
+**Патч:** убрать «подтверждение по таймауту». ACK считать доставленным, только когда в записи собеседника этот `mid` исчез (слот освобождён) или пришёл реальный ACK-сигнал. Отправку ACK делать счётной: не «пока видно», а «минимум N раз за M секунд» — это устойчивее и не зависит от кэша DNS-SD.
+
+### B5. 🟠 Дедупликация TXT глушит обновления
+
+`isDuplicateTxt()` — `1234`, окно `TXT_DEDUP_WINDOW_MS = 2_000`. Ключ включает `mid`, `ack`, `hb`, `sent`, `recv` (см. `buildTxtDedupeKey`, `1180–1205`) — но не `t`. Из-за этого:
+
+* запись слота сообщения **не меняется** после публикации → её повторные приходы считаются дубликатами → таймаут видимости (B4) наступает всегда;
+* если ACK потерялся, отправитель не публикует запись заново (слот статичен) → получатель не получит повода отправить ACK ещё раз.
+
+**Патч:** для слотов сообщений либо включить `t`/порядковый номер в ключ дедупликации и перерегистрировать слот раз в N секунд, либо не дедуплицировать по ключу, а дедуплицировать по `(mid, ack)` для **обработки текста**, но всё равно обновлять `activeIncomingMessages` (перенести `activeIncomingMessages.put` до проверки дедупликации).
+
+### B6. 🟠 Слот живёт 60 с и не переотправляется
+
+`registerMessageSlot()` (`1169–1191`): через 30 с — «extended», ещё через 30 с — `releaseSlot`, при этом `releaseSlot` удаляет сообщение из `pendingMessages` (`1116`). Доставка дальше возможна только через SYNC (раз в 60 с, `SyncManager.SYNC_INTERVAL`). На практике при потере одного ACK сообщение «доходит» через 1–2 минуты — это и есть ощущение «передача работает плохо». Рекомендуется явная повторная публикация слота (3 попытки по 10 с) вместо пассивного ожидания.
+
+### B7. 🟠 Ключ идентичности — MAC-адрес, а он не стабилен
+
+`deviceCache` ключуется `device.deviceAddress` (`getOrCreateDevice`, `1885`), в репозиторий сохраняется `state.address`, а `loadSavedDevicesToCache()` (`176`) восстанавливает кэш по адресу.
+
+Проблемы, зависящие от прошивки:
+
+* собственная «MAC» с Android 10+ без `LOCAL_MAC_ADDRESS` всегда `02:00:00:00:00:00` (это ровно то значение, что стоит по умолчанию в строке `71`) — как идентификатор бесполезна;
+* Wi-Fi Direct адрес **устройства** рандомизируется при создании интерфейса (AOSP требует этого начиная с Android 10, включается вендорским overlay `config_wifi_p2p_mac_randomization_supported`), а адрес интерфейса группы — при каждом соединении. Значит после перезагрузки телефона его P2P-MAC меняется;
+* итог: одно и то же физическое устройство даёт **новую запись** в кэше (а старая не удаляется, т.к. для неё есть состояние в репозитории — `cleanupExpiredDevices`, `1985`), в UI появляются дубли, история теряется, отправка может уйти в «фантомную» запись.
+
+**Патч:** ключ — `deviceId` из TXT/имени; `address` — только для отображения и обновлять его у существующей записи:
+
+```java
+private DiscoveredDevice getOrCreateDevice(WifiP2pDevice device, String knownDeviceId) {
+    String key = (knownDeviceId != null && knownDeviceId.length() >= 8)
+            ? knownDeviceId.substring(0, 8) : device.deviceAddress;
+    DiscoveredDevice dd = deviceCache.get(key);
+    if (dd == null) { dd = new DiscoveredDevice(); dd.deviceId = knownDeviceId; dd.address = device.deviceAddress; deviceCache.put(key, dd); }
+    else { dd.address = device.deviceAddress; } // MAC обновляем, идентичность не ломаем
+    ...
+}
+```
+
+и при загрузке из репозитория ключевать тоже по `deviceId`.
+
+### B8. 🟡 `setDeviceName` через рефлексию не работает на современных Android
+
+`setDeviceNameWithMarker()` — `631–647`: `manager.getClass().getMethod("setDeviceName", ...)`. Это скрытый (не-SDK) API; с Android 9+ такие вызовы блокируются (greylist/blacklist), вызов падает в `catch` и пишет лишь `"setDeviceName not available"`. Следствие: маркер `[WFD]` в имени не выставляется, раннее определение «своё приложение» и извлечение ID из имени (`extractDeviceIdFromName`, `2119`) не работают → устройство помечается `hasOurApp` только после первого TXT, а пользователь видит «❌ NoApp» и не может отправить сообщение.
+
+**Патч:** убрать рефлексию; `hasOurApp` определять по факту получения `WFD_Main`/`WFD_Msg*` (что уже есть в `handleServiceDiscovered`, `1500`), а в UI не блокировать отправку по `hasOurApp`, а пробовать отправить.
+
+### B9. 🟡 Устаревший Wi-Fi Lock и отсутствие восстановления состояния
+
+* `WifiManager.WIFI_MODE_FULL_HIGH_PERF` (строка `404`) устарел с API 29; для чувствительных к задержке сценариев нужен `WIFI_MODE_FULL_LOW_LATENCY` (API 29+) — на части устройств старый режим не мешает supplicant уходить в power-save при погашенном экране, и станция «замолкает».
+* Результат `wifiLock.acquire()` не проверяется по эффекту, `WifiManager.isWifiEnabled()` нигде не проверяется: с выключенным Wi-Fi приложение молча «работает» и ничего не слышит.
+* В `handleBroadcast()` (`2100+`) на `WIFI_P2P_STATE_CHANGED_ACTION` с `DISABLED` только пишется лог и показывается ошибка. Когда P2P включается обратно — **ничего не перезапускается**: ни `discoverPeers`, ни сервисы, ни запросы. Пользователь выключил/включил Wi-Fi — и приём не вернулся.
+
+**Патч:** при `enabled` — полный `initializeAndStart()` (или `softReconnect()`); при `disabled` — снять `isRunning`-зависимые таймеры и показать статус. Плюс `WIFI_MODE_FULL_LOW_LATENCY` для API ≥ 29.
+
+### B10. 🟡 Фоновое выживание и вендорские «убийцы»
+
+Foreground service есть, но:
+
+* нет запроса исключения из оптимизации батареи (`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) — на Xiaomi/Huawei/Samsung/Oppo сервис убивают через несколько минут, и «рация» замолкает именно на этих телефонах;
+* `onTaskRemoved()` (`DiscoveryService.java:107`) только логирует; стоит как минимум не давать сервису умирать при свайпе (уже `START_STICKY`), а лучше — подсказать пользователю про автозапуск вендора;
+* `startForeground` обёрнут в общий `catch`, и при отказе приложение продолжает работать «вслепую».
+
+---
+
+## Часть C. Мелочи и потенциальные падения
+
+1. **NPE/рассинхрон UI**: `MainActivity.updateDevice()` сравнивает `devices.get(i).address.equals(...)` — при `address == null` падение; лучше `Objects.equals`.
+2. **Hardcode лимита**: `MainActivity.onDeviceClick()` проверяет `pendingCount >= 3` вместо `P2pConfig.MAX_MSG_SLOTS` — при изменении конфига UI и ядро разойдутся.
+3. **Итерация по `Collections.synchronizedSet` без синхронизации** (`1057`, `1399`, `1472`): `it.remove()` во время чужой вставки → `ConcurrentModificationException`. Сейчас почти всё на main-thread, но `DiagnosticLogger` и репозиторий уже работают с других потоков — лучше обернуть в `synchronized (set) { ... }`.
+4. **`forceRefresh()` при каждом `onServiceConnected`** (`MainActivity.java:73`) рвёт discovery (см. A4) — убрать `stopPeerDiscovery`/`clearServiceRequests` из этого пути.
+5. **`DiagnosticLogger`** ограничен 500 записями и логирует каждую TXT-запись (`log.i("TXT #" + count ...)`, строка `1281`) — при бурсте это тысячи записей в секунду на main-thread; на слабых телефонах добавляет заметный лаг и мешает discovery-колбэкам. Стоит снизить уровень до `d` и включить только в диагностическом режиме.
+6. **README vs код**: формат `msgId` в README (`a1b2_695b_1`), в коде — `shortId_sessionId_counter` (18–20 байт), что напрямую уменьшает бюджет TXT (A1). Стоит синхронизировать документацию с реализацией.
+
+---
+
+## Часть D. Как подтвердить диагноз на «проблемном» телефоне
+
+1. **Логи приложения** (`DiagnosticActivity`, кнопка «Логи»). Ищите маркеры:
+
+| Строка в логе | Что означает |
+|---|---|
+| `FAILED to register main service: BUSY/ERROR` | A5 — станция не публикуется |
+| `Failed to register slot N` | A1/A5 — сообщение не ушло |
+| `Slot N extended - no ACK for ...` | B1–B5 — ACK не дошёл |
+| `Ignoring old message slot ... age=NNNs` | **A2 — часы собеседника** |
+| `Ignoring older cached record from ...` | **A2 — сессия/часы** |
+| `discoverServices failed: BUSY` | A4 |
+| `TXT #N | WFD_Msg0 | from ...` есть, а сообщения нет | A1 (переполнение TXT) или A2 (возраст) |
+| нет ни одной строки `TXT #` | A3/A4/B9 — поиск не идёт |
+
+2. **Проверить часы** на обоих устройствах (`adb shell date`) — расхождение > 2 минут уже ломает A2.
+3. **Проверить версию/прошивку**: `adb shell getprop ro.build.version.release`, `adb shell getprop ro.product.model`. Массовые жалобы обычно на Android 12–14 + конкретный вендор.
+4. **Проверить размер записи**: добавить в `registerMessageSlot` лог `log.i("TXT slot size=" + size + "B")` — сразу видно, уходим ли за 255.
+5. **Быстрый эксперимент**: отправить 20 символов латиницей и 90 символов кириллицей. Если первый доходит, а второй нет — это A1, ничего больше проверять не нужно.
+6. **Проверить ограничения ОС**: `adb shell cmd deviceidle whitelist`, отключённый Wi-Fi, включённая экономия энергии, «адаптивное подключение».
+
+---
+
+## Часть E. План исправлений
+
+**Этап 1 — «пусть работает хоть как-то» (1–2 дня):**
+1. A1 — байтовый лимит TXT + `fitTxtRecord` + лог усечения.
+2. A2 — убрать зависимость от чужих часов (возраст/сессии).
+3. A3 — вернуть цикл discovery после `clearAll()`.
+4. A4 — один планировщик, троттлинг, backoff на `BUSY`, не рвать запросы из `forceRefresh`.
+5. A5 — присваивать `mainServiceInfo` только при `onSuccess`, ретраи с backoff.
+
+**Этап 2 — корректность протокола (2–3 дня):**
+6. B1 — `pendingMessages.put` в `resendMessage`.
+7. B2 — принимать ACK без привязки к текущей сессии (+ чистка старых сессий при старте).
+8. B3 — убрать побочные эффекты из `buildAckString`, round-robin ACK.
+9. B4/B5 — не подтверждать доставку по таймауту, обновлять видимость до дедупликации, перерегистрировать слоты.
+10. B7 — идентичность по `deviceId`, MAC только для отображения.
+
+**Этап 3 — платформа и живучесть:**
+11. B8 (рефлексия), B9 (`LOW_LATENCY`, реакция на `STATE_CHANGED`), B10 (battery exemption), C1–C5.
+
+**Этап 4 — архитектурно правильное решение (рекомендуется как цель):**
+
+DNS-SD остаётся только «эфиром» (обнаружение + presence), а полезная нагрузка уходит в сокеты:
+
+* формируем P2P-группу (`WifiP2pConfig` с `groupOwnerIntent = 100` на «главной» станции, `connect()`), получаем IP group owner'а (`WifiP2pInfo.groupOwnerAddress`);
+* обмен по UDP (broadcast в группе) или TCP: сообщения любой длины, CRC/серия/ACK, ретрансмиссия, без лимита 255 байт и без кэша supplicant;
+* DNS-SD TXT уменьшается до 3–4 коротких полей (`id`, `sid`, `ip`, `port`) — а это и есть его штатное применение.
+
+Это устраняет первопричину почти всех P0/P1 из этого отчёта. Приложение уже объявляет `INTERNET` — дополнительных разрешений не потребуется.
+
+---
+
+## Приложение: расчёт размера TXT-записей (фактические значения)
+
+Замер на реальном формате записей из кода (`key=value` + 1 байт длины на строку):
+
+```
+msg  20 симв.: латиница 104 B, кириллица 124 B
+msg  40 симв.: латиница 124 B, кириллица 164 B
+msg  60 симв.: латиница 144 B, кириллица 204 B
+msg  80 симв.: латиница 164 B, кириллица 244 B
+msg 100 симв.: латиница 184 B, кириллица 284 B   ← > 255, доставки не будет
++ 3 ACK (≈100 B): кириллица 20 симв. → 188 B, кириллица 40 симв. → 264 B ← > 255
+WFD_Main без ACK: 48 B; с 5 ACK: 152 B
+WFD_Sync (3+3 msgId): 180 B
+```
+
+Практический безопасный предел для слотов сообщений: **~90 байт текста** при пустом `ack`, т.е. **~40 символов кириллицы** или ~80 латиницы.
