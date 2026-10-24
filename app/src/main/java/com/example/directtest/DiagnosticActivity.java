@@ -31,6 +31,7 @@ public class DiagnosticActivity extends AppCompatActivity implements DiagnosticL
         Button btnClear = findViewById(R.id.btn_clear);
         Button btnSave = findViewById(R.id.btn_save);
         Button btnShare = findViewById(R.id.btn_share);
+        Button btnExportCorr = findViewById(R.id.btn_export_corr);
         Button btnBack = findViewById(R.id.btn_back);
 
         logger = DiagnosticLogger.getInstance();
@@ -49,6 +50,9 @@ public class DiagnosticActivity extends AppCompatActivity implements DiagnosticL
         btnSave.setOnClickListener(v -> saveToFile());
 
         btnShare.setOnClickListener(v -> shareLogs());
+
+        // Журнал корреляции — то, по чему логи двух телефонов склеиваются
+        btnExportCorr.setOnClickListener(v -> shareCorrelationLog());
 
         btnBack.setOnClickListener(v -> finish());
 
@@ -90,6 +94,9 @@ public class DiagnosticActivity extends AppCompatActivity implements DiagnosticL
 
     private void saveToFile() {
         try {
+            // Журнал корреляции пишется потоково; перед сохранением сбрасываем
+            // буфер, чтобы файлы на двух телефонах были полными.
+            com.example.directtest.fast.CorrelationLog.get().flush();
             File file = logger.saveToFile(this);
             Toast.makeText(this,
                     "Сохранено:\n" + file.getAbsolutePath(),
@@ -99,6 +106,34 @@ public class DiagnosticActivity extends AppCompatActivity implements DiagnosticL
                     "Ошибка сохранения: " + e.getMessage(),
                     Toast.LENGTH_LONG).show();
         }
+    }
+
+    /**
+     * Поделиться журналом корреляции (TSV).
+     *
+     * <p>Этот файл — то, что нужно выгрузить с <b>обоих</b> телефонов: строки
+     * сопоставляются по колонке {@code trace} (для сообщений это {@code msgId}),
+     * а по {@code t_utc_ms} считается задержка.
+     */
+    private void shareCorrelationLog() {
+        com.example.directtest.fast.CorrelationLog corr =
+                com.example.directtest.fast.CorrelationLog.get();
+        corr.flush();
+
+        File file = corr.getFile();
+        String text = corr.snapshot();
+
+        if (file == null) {
+            Toast.makeText(this, "Журнал корреляции недоступен", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        Intent intent = new Intent(Intent.ACTION_SEND);
+        intent.setType("text/plain");
+        intent.putExtra(Intent.EXTRA_SUBJECT, "Ra-dio correlation " + corr.getDeviceId());
+        intent.putExtra(Intent.EXTRA_TEXT, text);
+        startActivity(Intent.createChooser(intent,
+                "Журнал корреляции: " + file.getName()));
     }
 
     private void shareLogs() {
