@@ -38,6 +38,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import android.net.wifi.WifiManager;
+import android.net.wifi.WifiP2pConfig;
+import android.net.wifi.WifiP2pInfo;
+import android.net.wifi.WpsInfo;
+
+import com.example.directtest.transport.P2pSocketTransport;
 
 public class FastDiscoveryManager {
 
@@ -110,6 +115,12 @@ public class FastDiscoveryManager {
     // SYNC system
     private DeviceStateRepository stateRepository;
     private SyncManager syncManager;
+
+    // Сокетный транспорт поверх P2P-группы (дополнительный канал доставки)
+    private P2pSocketTransport socketTransport;
+    private volatile boolean groupFormed = false;
+    private volatile boolean groupOwner = false;
+    private long lastGroupAttempt = 0;
 
     private final AtomicLong heartbeatSeq = new AtomicLong(0);
     private final AtomicInteger messageIdCounter = new AtomicInteger(0);
@@ -357,6 +368,7 @@ public class FastDiscoveryManager {
         serviceResponsesReceived.set(0);
 
         setDeviceNameWithMarker();
+        startSocketTransport();
         registerReceiver();
         initializeAndStart();
 
@@ -392,6 +404,9 @@ public class FastDiscoveryManager {
             manager.stopPeerDiscovery(channel, null);
             manager.removeGroup(channel, null);
         }
+
+        // Останавливаем сокетный транспорт
+        stopSocketTransport();
 
         // Освобождаем WiFi Lock
         releaseWifiLock();
@@ -581,6 +596,17 @@ public class FastDiscoveryManager {
         }
 
         registerMessageSlot(freeSlot, msgId, message, targetDeviceId);
+
+        // Дополнительный канал: если есть сокет до получателя — дублируем туда.
+        // Принимающая сторона отсекает дубликаты по msgId, поэтому двойная
+        // доставка безопасна и заметно ускоряет обмен.
+        if (socketTransport != null) {
+            boolean sent = socketTransport.sendMessage(targetDeviceId, msgId, message);
+            if (sent) {
+                log.success("SOCKET send OK: " + msgId
+                        + (targetDeviceId != null ? " to " + targetDeviceId : " (broadcast)"));
+            }
+        }
 
         log.i("SEND MESSAGE: " + msgId + " slot=" + freeSlot +
                 (targetDeviceId != null ? " to=" + targetDeviceId : " (broadcast)"));
@@ -783,6 +809,238 @@ public class FastDiscoveryManager {
     private void startDiscoverySequence() {
         schedulePeriodicTasks();
         requestDiscovery("start");
+    }
+
+    // ==================== SOCKET TRANSPORT (ЭТАП 4) ====================
+
+    /**
+     * Поднять сокетный транспорт, если он включён в конфигурации.
+     */
+    private void startSocketTransport() {
+        if (!P2pConfig.ENABLE_P2P_SOCKET_TRANSPORT) {
+            log.i("Socket transport disabled (P2pConfig.ENABLE_P2P_SOCKET_TRANSPORT=false)");
+            return;
+        }
+
+        socketTransport = new P2pSocketTransport(shortDeviceId, sessionId);
+        socketTransport.setCallback(new P2pSocketTransport.Callback() {
+            @Override
+            public void onPeerConnected(String deviceId) {
+                log.success("SOCKET peer connected: " + deviceId);
+                notifyStatus("Socket peer: " + deviceId);
+            }
+
+            @Override
+            public void onPeerDisconnected(String deviceId) {
+                log.w("SOCKET peer disconnected: " + deviceId);
+                notifyDeviceUpdatedLater(deviceId);
+            }
+
+            @Override
+            public void onMessageReceived(String senderDeviceId, String msgId, String text) {
+                handleSocketMessage(senderDeviceId, msgId, text);
+            }
+
+            @Override
+            public void onAckReceived(String senderDeviceId, String msgId) {
+                handleSocketAck(senderDeviceId, msgId);
+            }
+        });
+        socketTransport.start();
+        log.success("Socket transport started on port " + P2pConfig.SOCKET_PORT);
+    }
+
+    private void stopSocketTransport() {
+        if (socketTransport != null) {
+            socketTransport.stop();
+            socketTransport = null;
+        }
+        groupFormed = false;
+        groupOwner = false;
+    }
+
+    /**
+     * Приём сообщения по сокету. Логика та же, что для TXT-слота
+     * (дедупликация по msgId, история, ACK), но без ограничения длины.
+     */
+    private void handleSocketMessage(String senderDeviceId, String msgId, String text) {
+        if (msgId == null || senderDeviceId == null) return;
+
+        DiscoveredDevice dd = findDeviceByDeviceId(senderDeviceId);
+        if (dd == null) {
+            dd = createSocketOnlyDevice(senderDeviceId);
+        }
+
+        dd.lastSeen = System.currentTimeMillis();
+        dd.hasOurApp = true;
+
+        if (!processedMessageIds.add(msgId)) {
+            // Уже принято через TXT — просто отмечаем доставку
+            return;
+        }
+        trimSet(processedMessageIds, P2pConfig.MAX_PROCESSED_IDS);
+
+        dd.addReceivedMessage(msgId, text);
+
+        DeviceState state = stateRepository.getOrCreate(senderDeviceId);
+        state.addRecvMessage(msgId, text);
+        state.name = dd.name;
+        state.address = dd.address;
+        if (dd.sessionId != null) {
+            state.lastSessionId = dd.sessionId;
+        }
+        stateRepository.save();
+
+        log.success("MESSAGE VIA SOCKET: " + msgId + " from " + senderDeviceId);
+        log.i("Content: " + text);
+
+        if (listener != null && dd != null) {
+            handler.post(() -> listener.onMessageReceived(dd, msgId, text));
+        }
+
+        // Подтверждаем сразу по сокету — это быстрее и надёжнее TXT-пути
+        if (socketTransport != null) {
+            boolean sent = socketTransport.sendAck(senderDeviceId, msgId);
+            log.d("Socket ACK for " + msgId + ": " + (sent ? "sent" : "failed"));
+        }
+
+        notifyDeviceUpdated(dd);
+    }
+
+    /**
+     * Приём ACK по сокету.
+     */
+    private void handleSocketAck(String senderDeviceId, String msgId) {
+        DiscoveredDevice dd = findDeviceByDeviceId(senderDeviceId);
+        if (dd == null) {
+            dd = createSocketOnlyDevice(senderDeviceId);
+        }
+        processReceivedAcks(msgId, dd);
+    }
+
+    /**
+     * Найти устройство по его deviceId (а не по MAC).
+     */
+    private DiscoveredDevice findDeviceByDeviceId(String deviceId) {
+        if (deviceId == null) return null;
+
+        String address = deviceIdToAddress.get(deviceId);
+        if (address != null) {
+            DiscoveredDevice dd = deviceCache.get(address);
+            if (dd != null) return dd;
+        }
+
+        for (DiscoveredDevice dd : deviceCache.values()) {
+            if (deviceId.equals(dd.deviceId)) return dd;
+        }
+        return null;
+    }
+
+    /**
+     * Создать «сокетное» устройство, если TXT-обнаружение его ещё не увидело.
+     */
+    private DiscoveredDevice createSocketOnlyDevice(String deviceId) {
+        DiscoveredDevice dd = new DiscoveredDevice();
+        dd.deviceId = deviceId;
+        dd.address = "p2p:" + deviceId;
+        dd.name = "Socket " + deviceId;
+        dd.hasOurApp = true;
+        dd.firstSeen = System.currentTimeMillis();
+        dd.lastSeen = System.currentTimeMillis();
+        dd.seenCount = 1;
+
+        deviceCache.put(dd.address, dd);
+        deviceIdToAddress.put(deviceId, dd.address);
+        notifyDeviceFound(dd);
+        log.i("Created socket-only device entry: " + deviceId);
+        return dd;
+    }
+
+    private void notifyDeviceUpdatedLater(String deviceId) {
+        DiscoveredDevice dd = findDeviceByDeviceId(deviceId);
+        if (dd != null) notifyDeviceUpdated(dd);
+    }
+
+    /**
+     * Попытка сформировать P2P-группу для сокетного транспорта.
+     *
+     * Инициирует только устройство с лексикографически меньшим deviceId —
+     * иначе обе стороны одновременно вызывают connect() и получают ERROR.
+     */
+    private void maybeInitiateGroup() {
+        if (socketTransport == null || !P2pConfig.ENABLE_P2P_SOCKET_TRANSPORT) return;
+        if (groupFormed || socketTransport.getConnectedCount() > 0) return;
+
+        long now = System.currentTimeMillis();
+        if (now - lastGroupAttempt < P2pConfig.GROUP_RETRY_INTERVAL_MS) return;
+
+        DiscoveredDevice best = null;
+        for (DiscoveredDevice dd : deviceCache.values()) {
+            if (!dd.hasOurApp || dd.deviceId == null || dd.deviceId.length() < 8) continue;
+            if (!dd.isOnline()) continue;
+            if (dd.address == null || dd.address.startsWith("p2p:")) continue;
+            if (best == null || dd.deviceId.compareTo(best.deviceId) < 0) {
+                best = dd;
+            }
+        }
+        if (best == null) return;
+
+        // Тай-брейк: инициирует только «меньший» ID
+        if (shortDeviceId.compareTo(best.deviceId) > 0) {
+            return;
+        }
+
+        lastGroupAttempt = now;
+        log.i("Initiating P2P group with " + best.getShortId() + " (" + best.address + ")");
+
+        WifiP2pConfig config = new WifiP2pConfig();
+        config.deviceAddress = best.address;
+        config.wps.setup = WpsInfo.PBC;
+        config.groupOwnerIntent = 15;   // максимум — хотим быть владельцем группы
+
+        manager.connect(channel, config, new WifiP2pManager.ActionListener() {
+            @Override
+            public void onSuccess() {
+                log.success("P2P connect initiated to " + best.getShortId());
+            }
+
+            @Override
+            public void onFailure(int reason) {
+                log.w("P2P connect failed: " + reasonToString(reason));
+            }
+        });
+    }
+
+    /**
+     * Обработать изменение состояния P2P-соединения для сокетного транспорта.
+     */
+    private void handleGroupConnection() {
+        manager.requestConnectionInfo(channel, (WifiP2pInfo info) -> {
+            if (info == null) {
+                groupFormed = false;
+                log.d("Connection info: null");
+                return;
+            }
+
+            groupFormed = info.groupFormed;
+            groupOwner = info.isGroupOwner;
+
+            log.i("Connection info: formed=" + info.groupFormed
+                    + " isGO=" + info.isGroupOwner
+                    + " owner=" + (info.groupOwnerAddress != null
+                    ? info.groupOwnerAddress.getHostAddress() : "null"));
+
+            if (socketTransport != null) {
+                socketTransport.onGroupInfo(
+                        info.groupFormed, info.isGroupOwner, info.groupOwnerAddress);
+            }
+
+            if (!info.groupFormed) {
+                // Группа распалась — соединения закрыты, дальше работаем по TXT
+                handler.postDelayed(FastDiscoveryManager.this::maybeInitiateGroup,
+                        P2pConfig.GROUP_RETRY_INTERVAL_MS);
+            }
+        });
     }
 
     // ==================== MAIN SERVICE ====================
@@ -2379,6 +2637,7 @@ public class FastDiscoveryManager {
         public void run() {
             if (!isRunning) return;
             cleanupExpiredDevices();
+            maybeInitiateGroup();
             handler.postDelayed(this, P2pConfig.DEVICE_ONLINE_THRESHOLD / 2);
         }
     };
@@ -2453,6 +2712,12 @@ public class FastDiscoveryManager {
         sb.append("Discovery active: ").append(discoveryInProgress).append("\n");
         sb.append("Restart count: ").append(discoveryRestartCount).append("\n");
         sb.append("WiFi Lock: ").append(wifiLock != null && wifiLock.isHeld()).append("\n");
+        sb.append("Socket transport: ")
+                .append(socketTransport != null ? "ON" : "off")
+                .append(" | peers=")
+                .append(socketTransport != null ? socketTransport.getConnectedCount() : 0)
+                .append(" | group=").append(groupFormed)
+                .append(" | GO=").append(groupOwner).append("\n");
 
         long now = System.currentTimeMillis();
         if (lastDiscoveryTime > 0) {
@@ -2746,6 +3011,14 @@ public class FastDiscoveryManager {
 
             case WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION:
                 WifiP2pGroup group = intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_GROUP);
+
+                if (P2pConfig.ENABLE_P2P_SOCKET_TRANSPORT) {
+                    // Группа нужна для сокетного транспорта: не рвём её, а
+                    // сообщаем транспорту параметры (кто владелец, какой адрес).
+                    handleGroupConnection();
+                    break;
+                }
+
                 if (group != null) {
                     log.d("Connection changed: isGO=" + group.isGroupOwner() +
                             " clients=" + group.getClientList().size());
