@@ -24,6 +24,10 @@
     <!-- Для WiFi Lock - предотвращение засыпания WiFi -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Исключение из оптимизации батареи: без него вендорские прошивки
+         убивают foreground service и приём прекращается -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"

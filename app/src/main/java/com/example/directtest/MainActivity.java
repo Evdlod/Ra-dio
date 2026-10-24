@@ -275,6 +275,37 @@ public class MainActivity extends AppCompatActivity implements DiscoveryService.
         }
         // Все разрешения есть - запускаем сервис
         startDiscoveryService();
+        offerBatteryOptimizationExemption();
+    }
+
+    /**
+     * На Xiaomi/Huawei/Samsung/Oppo агрессивный менеджер батареи убивает
+     * foreground service через несколько минут — «рация» замолкает именно на
+     * этих телефонах. Просим пользователя добавить приложение в исключения.
+     */
+    private void offerBatteryOptimizationExemption() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+
+        android.os.PowerManager pm =
+                (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm == null || pm.isIgnoringBatteryOptimizations(getPackageName())) return;
+
+        new AlertDialog.Builder(this)
+                .setTitle("Стабильная работа в фоне")
+                .setMessage("Чтобы приём не прекращался при погашенном экране, "
+                        + "разрешите приложению работать без оптимизации батареи.")
+                .setPositiveButton("Разрешить", (d, w) -> {
+                    try {
+                        Intent intent = new Intent(
+                                android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                        intent.setData(android.net.Uri.parse("package:" + getPackageName()));
+                        startActivity(intent);
+                    } catch (Exception e) {
+                        log("Battery optimization intent failed: " + e.getMessage());
+                    }
+                })
+                .setNegativeButton("Позже", null)
+                .show();
     }
 
     @Override
@@ -399,7 +430,7 @@ public class MainActivity extends AppCompatActivity implements DiscoveryService.
     private void updateDevice(DiscoveredDevice device) {
         int idx = -1;
         for (int i = 0; i < devices.size(); i++) {
-            if (devices.get(i).address.equals(device.address)) {
+            if (java.util.Objects.equals(devices.get(i).address, device.address)) {
                 idx = i;
                 break;
             }
@@ -420,8 +451,11 @@ public class MainActivity extends AppCompatActivity implements DiscoveryService.
             return;
         }
 
-        if (!device.hasOurApp) {
-            Toast.makeText(this, "На устройстве нет приложения", Toast.LENGTH_SHORT).show();
+        // hasOurApp ставится по маркеру в имени (рефлексия setDeviceName, работает
+        // не на всех прошивках) или по факту получения TXT-записи. Если deviceId
+        // уже известен — приложение точно есть, отправлять можно.
+        if (!device.hasOurApp && device.deviceId == null) {
+            Toast.makeText(this, "На устройстве не обнаружено приложение", Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -432,8 +466,10 @@ public class MainActivity extends AppCompatActivity implements DiscoveryService.
 
         // ДОБАВЛЕНО: Проверка лимита на стороне UI
         int pendingCount = device.getPendingSentMessagesCount();
-        if (pendingCount >= 3) {
-            Toast.makeText(this, "Лимит: 3 неподтверждённых сообщения.\nДождитесь подтверждения.", Toast.LENGTH_LONG).show();
+        if (pendingCount >= P2pConfig.MAX_MSG_SLOTS) {
+            Toast.makeText(this,
+                    "Лимит: " + P2pConfig.MAX_MSG_SLOTS + " неподтверждённых сообщения.\nДождитесь подтверждения.",
+                    Toast.LENGTH_LONG).show();
             return;
         }
 

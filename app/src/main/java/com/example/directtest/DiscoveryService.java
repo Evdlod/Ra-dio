@@ -120,7 +120,14 @@ public class DiscoveryService extends Service implements DiscoveryListener {
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        log("onTaskRemoved - app swiped from recents");
+        log("onTaskRemoved - app swiped from recents, keeping radio alive");
+
+        // Сервис не должен умирать вместе с задачей: START_STICKY вернёт его,
+        // но лучше явно перезапустить обновление уведомления после возможного
+        // пересоздания процесса.
+        handler.removeCallbacks(statusUpdateRunnable);
+        handler.postDelayed(statusUpdateRunnable, 1000);
+
         super.onTaskRemoved(rootIntent);
     }
 

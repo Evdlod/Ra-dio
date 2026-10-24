@@ -65,44 +65,66 @@ public final class P2pConfig {
     public static final int MAX_RECENT_TXT_RECORDS = 50;
 
     /**
-     * Максимальная длина сообщения в TXT record
+     * Максимальная длина сообщения в TXT record (в СИМВОЛАХ, жёсткий предел UI).
+     * ВНИМАНИЕ: реальное ограничение DNS-SD — байты, см. MAX_TEXT_BYTES.
+     * Кириллица в UTF-8 занимает 2 байта на символ, эмодзи — 4.
      */
     public static final int MAX_MESSAGE_LENGTH = 100;
+
+    /**
+     * Бюджет одного TXT-рекорда в байтах.
+     * Протокол DNS-SD ограничивает строку 255 байтами, а весь TXT-рекорд
+     * рекомендуется держать в пределах ~200-240 байт. Превышение приводит
+     * к тому, что часть стеков молча выбрасывает запись: сообщение не
+     * доставляется и никакой ошибки в лог не попадает.
+     */
+    public static final int MAX_TXT_RECORD_BYTES = 240;
+
+    /**
+     * Максимальный размер текста сообщения в байтах UTF-8.
+     * Ограничение применяется до подгонки всей записи под MAX_TXT_RECORD_BYTES.
+     */
+    public static final int MAX_TEXT_BYTES = 120;
+
+    /**
+     * Минимальный осмысленный размер текста (если под ACK остаётся меньше —
+     * ACK выбрасывается из записи, чтобы не терять текст сообщения).
+     */
+    public static final int MIN_TEXT_BYTES = 24;
 
     /**
      * Максимальное количество ACK в одной записи
      */
     public static final int MAX_ACKS_PER_RECORD = 5;
 
-    // ==================== TIMING: BURST DISCOVERY ====================
-
-    // ==================== TIMING: BURST DISCOVERY ====================
-
-    /**
-     * Интервал между шагами начального burst (мс)
-     * ИЗМЕНЕНО: было 300, стало 200 для более быстрого обнаружения
-     */
-    public static final long INITIAL_BURST_INTERVAL = 200;
-
-    /**
-     * Количество шагов начального burst
-     * ИЗМЕНЕНО: было 5, стало 8 для более надёжного обнаружения
-     */
-    public static final int INITIAL_BURST_COUNT = 8;
-
-    /**
-     * Интервал между шагами основного burst (мс)
-     * ИЗМЕНЕНО: было 600, стало 400
-     */
-    public static final long BURST_INTERVAL = 400;
-
-    /**
-     * Количество шагов основного burst
-     */
-    public static final int BURST_COUNT = 8;
-
-
     // ==================== TIMING: DISCOVERY ====================
+
+    /**
+     * Минимальный интервал между запросами discovery (мс).
+     * discoverPeers/discoverServices — асинхронные команды supplicant:
+     * повторный вызов во время активного поиска возвращает BUSY, а на части
+     * прошивок прерывает текущий поиск и результаты теряются.
+     *
+     * Это «пол» для любых источников запроса (периодика, PEERS_CHANGED,
+     * регистрация слота, forceRefresh). Быстрый режим (FAST_INTERVAL = 3 с)
+     * фактически ограничен этим значением.
+     */
+    public static final long MIN_DISCOVER_GAP_MS = 4_000;
+
+    /**
+     * Задержка между discoverPeers и discoverServices внутри одного цикла (мс)
+     */
+    public static final long DISCOVER_SERVICES_DELAY_MS = 150;
+
+    /**
+     * Максимальное количество повторов discoverServices при BUSY
+     */
+    public static final int DISCOVER_MAX_RETRIES = 3;
+
+    /**
+     * Базовая задержка повтора при BUSY (мс), растёт экспоненциально: 2с, 4с, 8с
+     */
+    public static final long DISCOVER_RETRY_BASE_MS = 2_000;
 
     /**
      * Быстрый интервал discovery после обнаружения нового устройства (мс)
@@ -149,14 +171,32 @@ public final class P2pConfig {
     // ==================== TIMING: MESSAGES ====================
 
     /**
-     * Таймаут слота сообщения (мс)
+     * Таймаут слота сообщения (мс). Устарело: используется SLOT_RENEW_INTERVAL.
      */
     public static final long SLOT_TIMEOUT = 30_000;
+
+    /**
+     * Интервал между переопубликациями слота без ACK (мс).
+     * Каждая переопубликация обновляет DNS-кэш собеседника.
+     */
+    public static final long SLOT_RENEW_INTERVAL = 15_000;
+
+    /**
+     * Сколько раз переопубликовывать слот, прежде чем освободить его
+     * (15 с × 3 = 45 с, после чего сообщение уходит в SYNC).
+     */
+    public static final int SLOT_RENEW_ROUNDS = 3;
 
     /**
      * Максимальный возраст сообщения в секундах (TTL)
      */
     public static final long MAX_MSG_AGE_SEC = 120;
+
+    /**
+     * Предел правдоподобного расхождения часов с собеседником (мс).
+     * Более сильное расхождение не запоминается, чтобы не «сломать» фильтр возраста.
+     */
+    public static final long CLOCK_SKEW_LIMIT_MS = 12L * 60 * 60 * 1000;
 
     /**
      * Окно дедупликации TXT записей (мс)
@@ -174,6 +214,54 @@ public final class P2pConfig {
      * Время жизни устройства в кэше (мс)
      */
     public static final long CACHE_TTL = 120_000;
+
+    // ==================== TRANSPORT: СОКЕТЫ ПОВЕРХ P2P-ГРУППЫ ====================
+
+    /**
+     * Включить дополнительный транспорт сообщений по TCP поверх P2P-группы.
+     *
+     * ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО, потому что меняет модель работы приложения:
+     *  - для соединения Android показывает системный диалог «Принять запрос»
+     *    на принимающей стороне;
+     *  - на части прошивок во время активного соединения приостанавливается
+     *    поиск новых устройств;
+     *  - группа распадается при выходе из зоны.
+     *
+     * При включении DNS-SD остаётся слоем обнаружения и резервной доставки:
+     * сообщение уходит и по сокету, и в слот TXT, дубликаты отсекаются по msgId.
+     */
+    public static final boolean ENABLE_P2P_SOCKET_TRANSPORT = false;
+
+    /**
+     * TCP-порт сокетного транспорта
+     */
+    public static final int SOCKET_PORT = 8988;
+
+    /**
+     * Таймаут подключения к владельцу группы (мс)
+     */
+    public static final int SOCKET_CONNECT_TIMEOUT_MS = 8_000;
+
+    /**
+     * Количество попыток подключения к владельцу группы
+     */
+    public static final int SOCKET_CONNECT_ATTEMPTS = 5;
+
+    /**
+     * Таймаут чтения из сокета (мс). Если данных нет дольше — соединение
+     * считается мёртвым и закрывается.
+     */
+    public static final int SOCKET_READ_TIMEOUT_MS = 60_000;
+
+    /**
+     * Интервал heartbeat внутри сокетного соединения (мс)
+     */
+    public static final long SOCKET_HB_INTERVAL_MS = 15_000;
+
+    /**
+     * Минимальный интервал между попытками сформировать P2P-группу (мс)
+     */
+    public static final long GROUP_RETRY_INTERVAL_MS = 30_000;
 
     // ==================== PROTOCOL VERSION ====================
 
