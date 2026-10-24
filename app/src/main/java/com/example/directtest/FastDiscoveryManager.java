@@ -1,5 +1,6 @@
 package com.example.directtest;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -103,8 +104,9 @@ public class FastDiscoveryManager {
 
     private volatile boolean isRunning = false;
     private volatile boolean discoveryInProgress = false;
-    private int burstCount = 0;
-    private boolean initialBurstPhase = true;
+    private volatile long lastDiscoverCall = 0;
+    private volatile boolean mainServicePublishInFlight = false;
+    private volatile long mainServicePublishSince = 0;
     private long lastNewDeviceTime = 0;
     private long currentInterval = P2pConfig.NORMAL_INTERVAL;
     private long lastHeartbeatSentTime = 0;
@@ -332,8 +334,7 @@ public class FastDiscoveryManager {
         acquireWifiLock();
 
         isRunning = true;
-        burstCount = 0;
-        initialBurstPhase = true;
+        lastDiscoverCall = 0;
         discoveryRestartCount = 0;
         txtRecordsReceived.set(0);
         serviceResponsesReceived.set(0);
@@ -431,6 +432,10 @@ public class FastDiscoveryManager {
     public void clearAll() {
         log.divider("CLEAR ALL");
 
+        // ВНИМАНИЕ: removeCallbacksAndMessages(null) снимает ВСЕ задачи,
+        // включая цепочку discovery. Раньше после «Очистить» больше никто не
+        // вызывал discoverPeers/discoverServices, и приём не возвращался до
+        // перезапуска сервиса. Поэтому в конце метода цикл поднимается заново.
         handler.removeCallbacksAndMessages(null);
 
         for (SlotInfo slot : messageSlots.values()) {
@@ -484,6 +489,19 @@ public class FastDiscoveryManager {
         log.divider("FRESH START");
 
         schedulePeriodicTasks();
+
+        // Перезапуск цикла обнаружения: main-сервис мог остаться от прошлой
+        // публикации, но таймеры и запросы discovery были снесены выше.
+        lastDiscoverCall = 0;
+        mainServicePublishInFlight = false;
+        if (isRunning) {
+            if (mainServiceInfo != null) {
+                requestDiscovery("after-clear");
+            } else {
+                registerMainService(() -> requestDiscovery("after-clear"));
+            }
+        }
+
         notifyStatus("Cleared. Devices: " + deviceCache.size());
     }
 
@@ -562,11 +580,21 @@ public class FastDiscoveryManager {
 
 
 
+    /**
+     * Принудительное обновление эфира.
+     *
+     * ВАЖНО: здесь нельзя вызывать stopPeerDiscovery()/clearServiceRequests().
+     * Раньше forceRefresh() вызывался при каждом onServiceConnected() (вход в
+     * приложение, поворот экрана) и сносил зарегистрированные service requests:
+     * на время их отсутствия TXT-записи не приходили, входящие сообщения и
+     * ACK терялись, а supplicant отвечал BUSY.
+     */
     public void forceRefresh() {
         if (!isRunning) return;
         log.divider("FORCE REFRESH");
+        lastDiscoverCall = 0;            // разрешаем немедленный проход
         handler.removeCallbacks(discoveryRunnable);
-        restartServiceDiscovery();
+        requestDiscovery("forceRefresh");
     }
 
     // ==================== GETTERS ====================
@@ -724,57 +752,44 @@ public class FastDiscoveryManager {
     }
 
     private void startDiscoverySequence() {
-        manager.discoverPeers(channel, null);
-        handler.postDelayed(() -> manager.discoverServices(channel, null), 500);
         schedulePeriodicTasks();
-        handler.postDelayed(this::performBurstStep, P2pConfig.INITIAL_BURST_INTERVAL);
-    }
-
-    private void restartServiceDiscovery() {
-        manager.stopPeerDiscovery(channel, null);
-        manager.clearServiceRequests(channel, new WifiP2pManager.ActionListener() {
-            @Override
-            public void onSuccess() {
-                serviceRequests.clear();
-                setupServiceListeners();
-                addServiceRequests(() -> {
-                    burstCount = 0;
-                    initialBurstPhase = true;
-                    handler.postDelayed(() -> performBurstStep(), 300);
-                });
-            }
-            @Override
-            public void onFailure(int r) {
-                serviceRequests.clear();
-                addServiceRequests(() -> {
-                    burstCount = 0;
-                    performBurstStep();
-                });
-            }
-        });
+        requestDiscovery("start");
     }
 
     // ==================== MAIN SERVICE ====================
 
     private void registerMainService(Runnable onComplete) {
+        registerMainService(onComplete, 0);
+    }
+
+    private void registerMainService(Runnable onComplete, int attempt) {
         Map<String, String> record = buildMainServiceRecord();
 
         log.divider("REGISTER MAIN SERVICE");
         log.i("Record: " + record.toString());
+        fitTxtRecord(record, "Main(register)");
 
-        mainServiceInfo = WifiP2pDnsSdServiceInfo.newInstance(
+        WifiP2pDnsSdServiceInfo info = WifiP2pDnsSdServiceInfo.newInstance(
                 P2pConfig.MAIN_SERVICE_NAME, P2pConfig.SERVICE_TYPE, record);
 
-        manager.addLocalService(channel, mainServiceInfo, new WifiP2pManager.ActionListener() {
+        manager.addLocalService(channel, info, new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
+                // Указатель выставляем только для реально зарегистрированного сервиса
+                mainServiceInfo = info;
                 log.success("MAIN SERVICE REGISTERED: " + shortDeviceId);
                 onComplete.run();
             }
             @Override
             public void onFailure(int reason) {
-                log.error("FAILED to register main service: " + reasonToString(reason));
-                handler.postDelayed(() -> registerMainService(onComplete), 1000);
+                log.error("FAILED to register main service: " + reasonToString(reason)
+                        + " (attempt " + attempt + ")");
+                long delay = P2pConfig.DISCOVER_RETRY_BASE_MS << Math.min(attempt, 3);
+                if (attempt < 5) {
+                    handler.postDelayed(() -> registerMainService(onComplete, attempt + 1), delay);
+                } else {
+                    log.error("Main service registration abandoned after " + attempt + " attempts");
+                }
             }
         });
     }
@@ -816,36 +831,105 @@ public class FastDiscoveryManager {
     }
 
     private void updateMainService() {
-        if (!isRunning || mainServiceInfo == null) return;
+        if (!isRunning) return;
+
+        // Если сервис не зарегистрирован (например, все попытки провалились),
+        // heartbeat должен восстановить его, а не молча простаивать.
+        if (mainServiceInfo == null) {
+            log.w("Main service missing on heartbeat, re-registering");
+            registerMainService(() -> requestDiscovery("heartbeat-reregister"));
+            return;
+        }
+
+        // Предыдущая публикация ещё в полёте — не наслаиваем remove/add,
+        // иначе supplicant отвечает BUSY и станция «пропадает» из эфира.
+        if (mainServicePublishInFlight) {
+            long stuckMs = System.currentTimeMillis() - mainServicePublishSince;
+            if (stuckMs < 15_000) {
+                log.d("Main service publish in flight, skipping heartbeat update");
+                return;
+            }
+            // Колбэк потерялся (бывает при перезапуске supplicant) — снимаем блокировку
+            log.w("Main service publish stuck " + stuckMs + "ms, resetting flag");
+            mainServicePublishInFlight = false;
+        }
 
         heartbeatSeq.incrementAndGet();
         lastHeartbeatSentTime = System.currentTimeMillis();
-        Map<String, String> record = buildMainServiceRecord();
 
+        publishMainService(0);
+    }
+
+    /**
+     * Публикация WFD_Main с повторами.
+     *
+     * Ключевое отличие от прежней реализации: mainServiceInfo переключается на
+     * новую запись ТОЛЬКО после успешного addLocalService. Иначе указатель
+     * указывал на незарегистрированный сервис, следующий removeLocalService
+     * не находил его — и станция исчезала из эфира навсегда, продолжая
+     * считать heartbeat.
+     */
+    private void publishMainService(int attempt) {
+        if (!isRunning) return;
+
+        Map<String, String> record = buildMainServiceRecord();
         String acks = record.get("ack");
         if (acks != null && !acks.isEmpty()) {
             log.success("Including ACKs in HB: " + acks);
         }
-        log.d("Updating main service, hb=" + heartbeatSeq.get());
+        fitTxtRecord(record, "Main");
 
         WifiP2pDnsSdServiceInfo newInfo = WifiP2pDnsSdServiceInfo.newInstance(
                 P2pConfig.MAIN_SERVICE_NAME, P2pConfig.SERVICE_TYPE, record);
+        WifiP2pDnsSdServiceInfo oldInfo = mainServiceInfo;
 
-        manager.removeLocalService(channel, mainServiceInfo, new WifiP2pManager.ActionListener() {
+        mainServicePublishInFlight = true;
+        mainServicePublishSince = System.currentTimeMillis();
+
+        WifiP2pManager.ActionListener addListener = new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
-                manager.addLocalService(channel, newInfo, new WifiP2pManager.ActionListener() {
-                    @Override public void onSuccess() {
-                        mainServiceInfo = newInfo;
-                        log.d("Main service updated OK");
-                    }
-                    @Override public void onFailure(int r) { mainServiceInfo = newInfo; }
-                });
+                mainServicePublishInFlight = false;
+                mainServiceInfo = newInfo;
+                log.d("Main service updated OK, hb=" + heartbeatSeq.get());
             }
+
             @Override
             public void onFailure(int r) {
-                manager.addLocalService(channel, newInfo, null);
-                mainServiceInfo = newInfo;
+                mainServicePublishInFlight = false;
+                log.w("Main service add failed: " + reasonToString(r) + " (attempt " + attempt + ")");
+
+                // Возвращаем указатель на старую (возможно всё ещё валидную) запись
+                mainServiceInfo = oldInfo;
+
+                if (attempt < P2pConfig.DISCOVER_MAX_RETRIES) {
+                    long delay = P2pConfig.DISCOVER_RETRY_BASE_MS << attempt;
+                    log.d("Main service retry in " + delay + "ms");
+                    handler.postDelayed(() -> publishMainService(attempt + 1), delay);
+                } else {
+                    log.error("Main service publish failed permanently — re-registering from scratch");
+                    handler.postDelayed(() -> registerMainService(() -> {}), 1000);
+                }
+            }
+        };
+
+        if (oldInfo == null) {
+            manager.addLocalService(channel, newInfo, addListener);
+            return;
+        }
+
+        manager.removeLocalService(channel, oldInfo, new WifiP2pManager.ActionListener() {
+            @Override
+            public void onSuccess() {
+                manager.addLocalService(channel, newInfo, addListener);
+            }
+
+            @Override
+            public void onFailure(int r) {
+                // Старую запись снять не удалось — возможно, её уже нет.
+                // Пробуем добавить новую, не теряя указатель на старую до успеха.
+                log.d("Main service remove failed: " + reasonToString(r) + ", adding anyway");
+                manager.addLocalService(channel, newInfo, addListener);
             }
         });
     }
@@ -885,6 +969,7 @@ public class FastDiscoveryManager {
         record.put("ack", ackSb.toString());
 
         log.success("ACK Service update: " + ackSb.toString());
+        fitTxtRecord(record, "Ack");
 
         WifiP2pDnsSdServiceInfo newAckService = WifiP2pDnsSdServiceInfo.newInstance(
                 P2pConfig.ACK_SERVICE_NAME, P2pConfig.SERVICE_TYPE, record);
@@ -905,8 +990,16 @@ public class FastDiscoveryManager {
                 }
                 @Override
                 public void onFailure(int r) {
-                    manager.addLocalService(channel, newAckService, null);
-                    ackServiceInfo = newAckService;
+                    log.w("ACK service remove failed: " + reasonToString(r) + ", adding anyway");
+                    manager.addLocalService(channel, newAckService, new WifiP2pManager.ActionListener() {
+                        @Override public void onSuccess() {
+                            ackServiceInfo = newAckService;
+                            log.success("ACK service created: " + ackSb.toString());
+                        }
+                        @Override public void onFailure(int r2) {
+                            log.w("Failed to create ACK service: " + reasonToString(r2));
+                        }
+                    });
                 }
             });
         } else {
@@ -916,7 +1009,7 @@ public class FastDiscoveryManager {
                     log.success("ACK service created: " + ackSb.toString());
                 }
                 @Override public void onFailure(int r) {
-                    log.w("Failed to create ACK service");
+                    log.w("Failed to create ACK service: " + reasonToString(r));
                 }
             });
         }
@@ -939,6 +1032,7 @@ public class FastDiscoveryManager {
 
         log.i("Publishing SYNC to " + shortTargetId +
                 " | sent=" + mySentIds + " | recv=" + myRecvIds);
+        fitTxtRecord(record, "Sync");
 
         WifiP2pDnsSdServiceInfo newSyncService = WifiP2pDnsSdServiceInfo.newInstance(
                 P2pConfig.SYNC_SERVICE_NAME, P2pConfig.SERVICE_TYPE, record);
@@ -1143,6 +1237,8 @@ public class FastDiscoveryManager {
             record.put("ack", acks);
         }
 
+        fitTxtRecord(record, "Msg" + slotIndex);
+
         String serviceName = P2pConfig.MSG_SLOT_PREFIX + slotIndex;
         WifiP2pDnsSdServiceInfo slotService = WifiP2pDnsSdServiceInfo.newInstance(
                 serviceName, P2pConfig.SERVICE_TYPE, record);
@@ -1159,7 +1255,7 @@ public class FastDiscoveryManager {
             public void onSuccess() {
                 slot.isRegistered = true;
                 log.success("Message slot " + slotIndex + " registered: " + msgId);
-                manager.discoverServices(channel, null);
+                requestDiscovery("slot-registered");
             }
             @Override
             public void onFailure(int r) {
@@ -1194,6 +1290,143 @@ public class FastDiscoveryManager {
     private String truncateMessage(String msg, int maxLen) {
         if (msg == null) return "";
         return msg.length() <= maxLen ? msg : msg.substring(0, maxLen);
+    }
+
+    // ==================== TXT RECORD SIZE BUDGET ====================
+
+    /**
+     * Размер строки в UTF-8. Именно байты, а не символы, ограничивает DNS-SD
+     * (кириллица — 2 байта на символ, эмодзи — 4).
+     */
+    private static int utf8Bytes(String s) {
+        return s == null ? 0 : s.getBytes(StandardCharsets.UTF_8).length;
+    }
+
+    /**
+     * Размер одной пары key=value в TXT-записи:
+     * служебный байт длины + "key=" + value (+1 байт на сам value).
+     */
+    private static int txtEntrySize(String key, String value) {
+        return 1 + utf8Bytes(key) + 1 + utf8Bytes(value);
+    }
+
+    /**
+     * Полный размер TXT-записи, как её кодирует Android.
+     */
+    private static int txtRecordSize(Map<String, String> record) {
+        if (record == null) return 0;
+        int size = 0;
+        for (Map.Entry<String, String> e : record.entrySet()) {
+            size += txtEntrySize(e.getKey(), e.getValue());
+        }
+        return size;
+    }
+
+    /**
+     * Обрезать строку до maxBytes в UTF-8, не разрывая суррогатные пары.
+     */
+    private String truncateUtf8(String s, int maxBytes) {
+        if (s == null) return "";
+        if (maxBytes <= 0) return "";
+        if (utf8Bytes(s) <= maxBytes) return s;
+
+        int end = s.length();
+        while (end > 0 && utf8Bytes(s.substring(0, end)) > maxBytes) {
+            end--;
+            // не отрезаем половину суррогатной пары
+            if (end > 0 && Character.isLowSurrogate(s.charAt(end))) {
+                end--;
+            }
+        }
+        return s.substring(0, end);
+    }
+
+    /**
+     * Подогнать TXT-запись под лимит DNS-SD.
+     *
+     * Порядок действий:
+     *  1. если запись влезает — ничего не меняем;
+     *  2. если мешает ACK — сначала выбрасываем его (ACK переотправится в
+     *     следующем heartbeat, а текст сообщения терять нельзя);
+     *  3. затем урезаем текст и обязательно пишем об этом в лог.
+     *
+     * Без этой подгонки запись с кириллицей уходит за 255 байт, и часть
+     * телефонов просто выбрасывает её — сообщение не доставляется молча.
+     */
+    private Map<String, String> fitTxtRecord(Map<String, String> record, String what) {
+        if (record == null) return null;
+
+        int budget = P2pConfig.MAX_TXT_RECORD_BYTES;
+        int size = txtRecordSize(record);
+        if (size <= budget) {
+            log.d("TXT " + what + ": " + size + "B (ok, budget " + budget + "B)");
+            return record;
+        }
+
+        log.w("TXT " + what + ": " + size + "B > " + budget + "B, fitting");
+
+        // Отдельно считаем фиксированную часть и вклад msg/ack
+        int fixed = 0;
+        for (Map.Entry<String, String> e : record.entrySet()) {
+            String k = e.getKey();
+            if ("msg".equals(k) || "ack".equals(k)) continue;
+            fixed += txtEntrySize(k, e.getValue());
+        }
+
+        String msg = record.get("msg");
+        String ack = record.get("ack");
+        // Бюджет под ЗНАЧЕНИЕ msg: вычитаем фиксированные поля, ack и служебные
+        // байты самого поля ("msg" + '=' + длина), иначе запись вылезает за лимит
+        // ровно на размер ключа.
+        int msgKeyOverhead = txtEntrySize("msg", "");
+        int ackSize = ack != null ? txtEntrySize("ack", ack) : 0;
+        int msgBudget = budget - fixed - ackSize - msgKeyOverhead;
+
+        if (msg != null && msgBudget < P2pConfig.MIN_TEXT_BYTES && ack != null) {
+            record.remove("ack");
+            ackSize = 0;
+            msgBudget = budget - fixed - msgKeyOverhead;
+            log.w("TXT " + what + ": ACK dropped to fit size limit");
+        }
+
+        if (msg != null) {
+            String capped = truncateUtf8(msg, P2pConfig.MAX_TEXT_BYTES);
+            if (!capped.equals(msg)) {
+                log.w("TXT " + what + ": text capped " + utf8Bytes(msg) + "B -> "
+                        + utf8Bytes(capped) + "B (max " + P2pConfig.MAX_TEXT_BYTES + "B)");
+                msg = capped;
+            }
+            if (utf8Bytes(msg) > msgBudget) {
+                String trimmed = truncateUtf8(msg, Math.max(0, msgBudget));
+                log.w("TXT " + what + ": text truncated " + utf8Bytes(msg) + "B -> "
+                        + utf8Bytes(trimmed) + "B to fit DNS-SD limit");
+                msg = trimmed;
+            }
+            record.put("msg", msg);
+        }
+
+        // Если запись всё ещё не влезает — уменьшаем список ACK по одному
+        // (актуально для WFD_Ack, где текста сообщения нет вовсе).
+        while (txtRecordSize(record) > budget) {
+            String ackList = record.get("ack");
+            if (ackList == null) break;
+            int lastComma = ackList.lastIndexOf(',');
+            if (lastComma <= 0) {
+                record.remove("ack");
+                log.w("TXT " + what + ": ACK list dropped entirely to fit size limit");
+                break;
+            }
+            record.put("ack", ackList.substring(0, lastComma));
+            log.w("TXT " + what + ": ACK list reduced to fit size limit");
+        }
+
+        int finalSize = txtRecordSize(record);
+        if (finalSize > budget) {
+            log.e("TXT " + what + " still " + finalSize + "B > " + budget + "B — record may be dropped!");
+        } else {
+            log.d("TXT " + what + " fitted: " + size + "B -> " + finalSize + "B");
+        }
+        return record;
     }
 
     // ==================== TXT DEDUPLICATION ====================
@@ -1336,6 +1569,14 @@ public class FastDiscoveryManager {
             try { dd.updateHeartbeat(Long.parseLong(hbStr)); } catch (NumberFormatException e) {}
         }
 
+        // Поправка часов собеседника: heartbeat публикуется каждые 5 секунд,
+        // поэтому его t ≈ «сейчас» у отправителя. Без этой поправки телефон
+        // с убежавшими часами выглядел как источник «старых» сообщений.
+        String tStr = record.get("t");
+        if (tStr != null) {
+            try { dd.updateClockSkew(Long.parseLong(tStr) * 1000L); } catch (NumberFormatException e) {}
+        }
+
         DeviceState state = stateRepository.getOrCreate(senderId);
         state.name = dd.name;
         state.address = dd.address;
@@ -1379,11 +1620,22 @@ public class FastDiscoveryManager {
 
         if (tStr != null) {
             try {
-                long msgTsSec = Long.parseLong(tStr);
-                long nowSec = System.currentTimeMillis() / 1000;
-                long ageSec = nowSec - msgTsSec;
+                long msgTsMs = Long.parseLong(tStr) * 1000L;
+
+                // Возраст считаем в шкале времени ОТПРАВИТЕЛЯ (его «сейчас»),
+                // иначе расхождение часов (даже на минуты) приводило к тому,
+                // что все сообщения устройства молча отбрасывались.
+                long peerNowMs = dd.hasClockSkew ? dd.peerNowMs() : msgTsMs;
+                long ageSec = (peerNowMs - msgTsMs) / 1000;
+
+                // «Будущее» сообщение — нормально в пределах небольшого дребезга
                 if (ageSec > P2pConfig.MAX_MSG_AGE_SEC) {
                     log.w("Ignoring old message slot " + msgId +
+                            " from " + senderId + " age=" + ageSec + "s");
+                    return;
+                }
+                if (ageSec < -P2pConfig.MAX_MSG_AGE_SEC) {
+                    log.w("Ignoring message with implausible future timestamp " + msgId +
                             " from " + senderId + " age=" + ageSec + "s");
                     return;
                 }
@@ -1601,55 +1853,87 @@ public class FastDiscoveryManager {
         });
     }
 
-    // ==================== BURST DISCOVERY ====================
+    // ==================== DISCOVERY (ЕДИНЫЙ ПЛАНИРОВЩИК) ====================
 
-    private void performBurstStep() {
+    /**
+     * Единственная точка входа для discoverPeers/discoverServices.
+     *
+     * Раньше в коде одновременно работали четыре независимых цикла
+     * (burst, performDiscovery, PEERS_CHANGED, регистрация слота). Каждый
+     * повторный discover* во время активного поиска возвращает BUSY, а на
+     * части прошивок ещё и прерывает текущий поиск, из-за чего результаты
+     * теряются. Здесь запросы сериализуются и троттлятся.
+     */
+    private void requestDiscovery(String reason) {
+        if (!isRunning || manager == null || channel == null) return;
+
+        long now = System.currentTimeMillis();
+        long sinceLast = now - lastDiscoverCall;
+        if (lastDiscoverCall != 0 && sinceLast < P2pConfig.MIN_DISCOVER_GAP_MS) {
+            log.d("Discovery throttled (" + reason + "), " + sinceLast + "ms since last");
+            return;
+        }
+        lastDiscoverCall = now;
+        discoveryInProgress = true;
+        lastDiscoveryTime = now;
+        log.d("Discovery requested: " + reason);
+
+        // Сторож: если колбэк discoverServices не придёт (зависший supplicant,
+        // перезагрузка Wi-Fi), цикл не должен остановиться навсегда.
+        handler.removeCallbacks(discoveryWatchdog);
+        handler.postDelayed(discoveryWatchdog, 20_000);
+
+        manager.discoverPeers(channel, new WifiP2pManager.ActionListener() {
+            @Override
+            public void onSuccess() {
+                log.d("discoverPeers started (" + reason + ")");
+                handler.postDelayed(() -> discoverServicesWithRetry(reason, 0),
+                        P2pConfig.DISCOVER_SERVICES_DELAY_MS);
+            }
+
+            @Override
+            public void onFailure(int r) {
+                log.w("discoverPeers failed: " + reasonToString(r) + " (" + reason + ")");
+                // peers не критичен: сразу пробуем services
+                handler.postDelayed(() -> discoverServicesWithRetry(reason, 0), 300);
+            }
+        });
+    }
+
+    /**
+     * discoverServices с повтором при BUSY и экспоненциальной паузой.
+     * Повтор через 500 мс (как было) гарантированно попадал в тот же BUSY.
+     */
+    private void discoverServicesWithRetry(String reason, int attempt) {
         if (!isRunning) return;
 
-        burstCount++;
-        discoveryInProgress = true;
+        manager.discoverServices(channel, new WifiP2pManager.ActionListener() {
+            @Override
+            public void onSuccess() {
+                discoveryInProgress = false;
+                handler.removeCallbacks(discoveryWatchdog);
+                log.d("discoverServices started (" + reason + ", attempt " + attempt + ")");
+                notifyStatus("Devices: " + deviceCache.size() + " | TXT: " + txtRecordsReceived.get());
+                scheduleNextDiscovery();
+            }
 
-        long interval = initialBurstPhase ? P2pConfig.INITIAL_BURST_INTERVAL : P2pConfig.BURST_INTERVAL;
-        int maxCount = initialBurstPhase ? P2pConfig.INITIAL_BURST_COUNT : P2pConfig.BURST_COUNT;
+            @Override
+            public void onFailure(int r) {
+                discoveryInProgress = false;
+                log.w("discoverServices failed: " + reasonToString(r)
+                        + " (" + reason + ", attempt " + attempt + ")");
 
-        log.i("BURST step " + burstCount + "/" + maxCount);
-
-        manager.discoverPeers(channel, null);
-
-        handler.postDelayed(() -> {
-            manager.discoverServices(channel, new WifiP2pManager.ActionListener() {
-                @Override
-                public void onSuccess() {
-                    discoveryInProgress = false;
-                    if (burstCount < maxCount) {
-                        handler.postDelayed(FastDiscoveryManager.this::performBurstStep, interval);
-                    } else if (initialBurstPhase) {
-                        initialBurstPhase = false;
-                        burstCount = 0;
-                        handler.postDelayed(FastDiscoveryManager.this::performBurstStep, P2pConfig.BURST_INTERVAL);
-                    } else {
-                        onBurstComplete();
-                    }
+                if (r == WifiP2pManager.BUSY && attempt < P2pConfig.DISCOVER_MAX_RETRIES) {
+                    long delay = P2pConfig.DISCOVER_RETRY_BASE_MS << attempt;
+                    log.d("Retrying discoverServices in " + delay + "ms");
+                    handler.postDelayed(() -> discoverServicesWithRetry(reason, attempt + 1), delay);
+                    return;
                 }
-                @Override
-                public void onFailure(int reason) {
-                    discoveryInProgress = false;
-                    if (burstCount < maxCount) {
-                        handler.postDelayed(FastDiscoveryManager.this::performBurstStep, interval * 2);
-                    } else {
-                        onBurstComplete();
-                    }
-                }
-            });
-        }, 100);
-    }
 
-    private void onBurstComplete() {
-        notifyStatus("Devices: " + deviceCache.size() + " | TXT: " + txtRecordsReceived.get());
-        currentInterval = P2pConfig.NORMAL_INTERVAL;
-        scheduleNextDiscovery();
+                scheduleNextDiscovery();
+            }
+        });
     }
-
 
     /**
      * Перерегистрация всех активных сервисов для обновления DNS кэша.
@@ -1755,8 +2039,14 @@ public class FastDiscoveryManager {
         handler.postDelayed(visibilityCheckRunnable, 5000);
         handler.postDelayed(onlineCheckRunnable, P2pConfig.DEVICE_ONLINE_THRESHOLD / 2);
         handler.postDelayed(syncCheckRunnable, P2pConfig.SYNC_CHECK_INTERVAL);
-        handler.postDelayed(dnsCacheResetRunnable, DNS_CACHE_RESET_INTERVAL);  // ДОБАВИТЬ
-        //handler.postDelayed(serviceReregisterRunnable, SERVICE_REREGISTER_INTERVAL);  // ДОБАВИТЬ
+        // ВАЖНО: dnsCacheResetRunnable (clearServiceRequests каждые 45 с) и
+        // serviceReregisterRunnable (remove+add всех сервисов каждые 30 с)
+        // намеренно НЕ планируются.
+        //  - clearServiceRequests: пока запросы сняты, TXT не приходят —
+        //    входящие сообщения и ACK теряются, supplicant отвечает BUSY;
+        //  - remove+add всех сервисов: окно без advertise + риск потерять
+        //    указатель на зарегистрированный сервис (станция «исчезает»).
+        // Свежесть WFD_Main обеспечивает heartbeat (publishMainService каждые 5 с).
     }
 
     private final Runnable heartbeatRunnable = new Runnable() {
@@ -1833,6 +2123,19 @@ public class FastDiscoveryManager {
         handler.postDelayed(discoveryRunnable, currentInterval);
     }
 
+    private final Runnable discoveryWatchdog = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning) return;
+            if (!discoveryInProgress) return;
+
+            log.w("Discovery watchdog: no callback within 20s, restarting cycle");
+            discoveryInProgress = false;
+            lastDiscoverCall = 0;
+            scheduleNextDiscovery();
+        }
+    };
+
     private final Runnable discoveryRunnable = new Runnable() {
         @Override
         public void run() {
@@ -1842,41 +2145,13 @@ public class FastDiscoveryManager {
     };
 
     private void performDiscovery() {
-        lastDiscoveryTime = System.currentTimeMillis();
-        discoveryInProgress = true;
+        requestDiscovery("periodic");
 
-        manager.discoverPeers(channel, new WifiP2pManager.ActionListener() {
-            @Override
-            public void onSuccess() {
-                log.d("discoverPeers started");
-            }
-            @Override
-            public void onFailure(int reason) {
-                log.w("discoverPeers failed: " + reasonToString(reason));
-            }
-        });
-
-        handler.postDelayed(() -> {
-            manager.discoverServices(channel, new WifiP2pManager.ActionListener() {
-                @Override
-                public void onSuccess() {
-                    log.d("discoverServices started");
-                    discoveryInProgress = false;
-                    scheduleNextDiscovery();
-                }
-                @Override
-                public void onFailure(int reason) {
-                    log.w("discoverServices failed: " + reasonToString(reason));
-                    discoveryInProgress = false;
-
-                    // При BUSY пробуем снова через короткий интервал
-                    if (reason == WifiP2pManager.BUSY) {
-                        handler.postDelayed(() -> manager.discoverServices(channel, null), 500);
-                    }
-                    scheduleNextDiscovery();
-                }
-            });
-        }, 100);
+        // Страховка: если requestDiscovery был оттроттлен (например, только что
+        // был forceRefresh), следующий проход всё равно должен быть запланирован.
+        if (!discoveryInProgress) {
+            scheduleNextDiscovery();
+        }
     }
 
     /**
@@ -1940,12 +2215,30 @@ public class FastDiscoveryManager {
 
     private void onNewDeviceFound() {
         lastNewDeviceTime = System.currentTimeMillis();
+
+        // Быстрый режим ограничен по времени: раньше currentInterval
+        // выставлялся в FAST_INTERVAL навсегда (раньше его сбрасывал
+        // onBurstComplete, а вместе с бёрстом пропал и сброс).
+        handler.removeCallbacks(fastModeRunnable);
+        handler.postDelayed(fastModeRunnable, P2pConfig.FAST_MODE_DURATION);
+
         if (currentInterval != P2pConfig.FAST_INTERVAL) {
             currentInterval = P2pConfig.FAST_INTERVAL;
             handler.removeCallbacks(discoveryRunnable);
             scheduleNextDiscovery();
         }
     }
+
+    private final Runnable fastModeRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning) return;
+            if (currentInterval != P2pConfig.NORMAL_INTERVAL) {
+                log.d("Leaving fast discovery mode after " + P2pConfig.FAST_MODE_DURATION + "ms");
+                currentInterval = P2pConfig.NORMAL_INTERVAL;
+            }
+        }
+    };
 
 //    private void cleanupExpiredDevices() {
 //        long now = System.currentTimeMillis();
@@ -2063,12 +2356,10 @@ public class FastDiscoveryManager {
                         }
                     }
 
-                    // Немедленный запрос сервисов после обнаружения peers
+                    // Запрос сервисов после обнаружения peers — через общий
+                    // троттлинг, иначе получаем BUSY на каждом событии
                     if (peerCount > 0) {
-                        handler.postDelayed(() -> {
-                            log.d("Triggering service discovery after peers found");
-                            manager.discoverServices(channel, null);
-                        }, 100);
+                        requestDiscovery("peers-changed");
                     }
                 });
                 break;

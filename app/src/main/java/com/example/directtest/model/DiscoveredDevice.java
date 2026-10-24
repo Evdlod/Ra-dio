@@ -59,6 +59,18 @@ public class DiscoveredDevice {
     /** Session ID устройства (timestamp-based hex) */
     public String sessionId;
 
+    /**
+     * Поправка часов собеседника относительно наших (мс).
+     * peerTime ≈ ourTime + clockSkewMs.
+     * Нужна потому, что все timestamp в TXT-записях ставятся часами отправителя,
+     * а на части устройств часы уходят на минуты — без поправки фильтр
+     * «возраста сообщения» отбрасывает все сообщения такого устройства.
+     */
+    public long clockSkewMs = 0;
+
+    /** Известна ли поправка часов (получен хотя бы один heartbeat с полем t) */
+    public boolean hasClockSkew = false;
+
     /** Флаг для отслеживания перехода online */
     private boolean wasOnlineLastCheck;
 
@@ -181,6 +193,38 @@ public class DiscoveredDevice {
             heartbeatSeq = newSeq;
             lastHeartbeatReceived = System.currentTimeMillis();
         }
+    }
+
+    /**
+     * Обновить поправку часов по timestamp из свежей записи собеседника
+     * (heartbeat/ACK-сервис публикуются каждые 2-5 секунд, поэтому t ≈ «сейчас»).
+     *
+     * @param peerTimeMs время собеседника в миллисекундах
+     */
+    public void updateClockSkew(long peerTimeMs) {
+        if (peerTimeMs <= 0) return;
+
+        long skew = peerTimeMs - System.currentTimeMillis();
+
+        // Отбрасываем неправдоподобные значения (битый timestamp, чужой формат)
+        if (Math.abs(skew) > P2pConfig.CLOCK_SKEW_LIMIT_MS) {
+            return;
+        }
+
+        // Сглаживаем: одна «странная» запись не должна ломать поправку
+        if (!hasClockSkew) {
+            clockSkewMs = skew;
+            hasClockSkew = true;
+        } else {
+            clockSkewMs = (clockSkewMs * 3 + skew) / 4;
+        }
+    }
+
+    /**
+     * Время собеседника, соответствующее нашему «сейчас»
+     */
+    public long peerNowMs() {
+        return System.currentTimeMillis() + clockSkewMs;
     }
 
     // ==================== ОТПРАВЛЕННЫЕ СООБЩЕНИЯ ====================
