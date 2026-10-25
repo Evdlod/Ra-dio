@@ -24,38 +24,59 @@ public final class SyncWindow {
     private SyncWindow() {
     }
 
-    /** Позиция внутри периода (мс). */
+    /** Позиция внутри периода (мс) при периоде по умолчанию. */
     public static long phase(long utcMs) {
-        long period = Math.max(1, P2pConfig.SYNC_WINDOW_PERIOD_MS);
+        return phase(utcMs, P2pConfig.SYNC_WINDOW_PERIOD_MS);
+    }
+
+    /** Позиция внутри произвольного периода (мс). */
+    public static long phase(long utcMs, long periodMs) {
+        long period = Math.max(1, periodMs);
         long p = utcMs % period;
         return p < 0 ? p + period : p;
     }
 
-    /** Открыто ли окно в момент {@code utcMs}. */
+    /** Открыто ли окно в момент {@code utcMs} при периоде по умолчанию. */
     public static boolean isOpen(long utcMs) {
-        return phase(utcMs) < P2pConfig.SYNC_WINDOW_LENGTH_MS;
+        return isOpen(utcMs, P2pConfig.SYNC_WINDOW_PERIOD_MS);
+    }
+
+    /**
+     * Открыто ли окно при произвольном периоде.
+     *
+     * Период выбирает вызывающая сторона: частый — когда есть что доставлять,
+     * редкий ({@link P2pConfig#SYNC_WINDOW_IDLE_PERIOD_MS}) — в покое, чтобы не
+     * дёргать supplicant без нужды.
+     */
+    public static boolean isOpen(long utcMs, long periodMs) {
+        return phase(utcMs, periodMs) < P2pConfig.SYNC_WINDOW_LENGTH_MS;
     }
 
     /** Сколько мс осталось до конца текущего окна (0, если окно закрыто). */
-    public static long msUntilClose(long utcMs) {
-        if (!isOpen(utcMs)) return 0;
-        return P2pConfig.SYNC_WINDOW_LENGTH_MS - phase(utcMs);
+    public static long msUntilClose(long utcMs, long periodMs) {
+        if (!isOpen(utcMs, periodMs)) return 0;
+        return P2pConfig.SYNC_WINDOW_LENGTH_MS - phase(utcMs, periodMs);
     }
 
     /** Сколько мс до открытия следующего окна (0, если окно уже открыто). */
-    public static long msUntilOpen(long utcMs) {
-        if (isOpen(utcMs)) return 0;
-        return P2pConfig.SYNC_WINDOW_PERIOD_MS - phase(utcMs);
+    public static long msUntilOpen(long utcMs, long periodMs) {
+        if (isOpen(utcMs, periodMs)) return 0;
+        return Math.max(1, periodMs) - phase(utcMs, periodMs);
     }
 
     /** Ближайшая граница начала окна (UTC, мс). */
     public static long nextBoundary(long utcMs) {
-        return utcMs + msUntilOpen(utcMs);
+        return utcMs + msUntilOpen(utcMs, P2pConfig.SYNC_WINDOW_PERIOD_MS);
     }
 
     /** Текстовое представление для лога: {@code open|closed@phase}. */
     public static String describe(long utcMs) {
-        long p = phase(utcMs);
-        return (isOpen(utcMs) ? "open" : "closed") + "@" + p;
+        return describe(utcMs, P2pConfig.SYNC_WINDOW_PERIOD_MS);
+    }
+
+    /** Текстовое представление для произвольного периода. */
+    public static String describe(long utcMs, long periodMs) {
+        long p = phase(utcMs, periodMs);
+        return (isOpen(utcMs, periodMs) ? "open" : "closed") + "@" + p;
     }
 }
