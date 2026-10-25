@@ -38,9 +38,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import android.net.wifi.WifiManager;
-import android.net.wifi.WifiP2pConfig;
-import android.net.wifi.WifiP2pInfo;
 import android.net.wifi.WpsInfo;
+import android.net.wifi.p2p.WifiP2pConfig;
+import android.net.wifi.p2p.WifiP2pInfo;
 
 import com.example.directtest.fast.BinaryFrame;
 import com.example.directtest.fast.BloomFilter;
@@ -1289,11 +1289,20 @@ public class FastDiscoveryManager {
     private WifiP2pConfig buildGroupConfig(DiscoveredDevice peer) {
         if (HwGuard.supportsPersistentGroup()) {
             try {
+                // ВАЖНО: setDeviceAddress принимает android.net.MacAddress,
+                // а не строку. Раньше сюда передавался peer.address (String) —
+                // это ошибка компиляции.
                 WifiP2pConfig.Builder builder = new WifiP2pConfig.Builder()
-                        .setDeviceAddress(peer.address)
                         .setNetworkName(groupNetworkName(peer))
                         .setPassphrase(P2pConfig.PERSISTENT_GROUP_PASSPHRASE);
 
+                if (isValidMac(peer.address)) {
+                    try {
+                        builder.setDeviceAddress(android.net.MacAddress.fromString(peer.address));
+                    } catch (IllegalArgumentException badMac) {
+                        log.w("Bad peer MAC, joining by SSID only: " + peer.address);
+                    }
+                }
                 if (HwGuard.supportsBandSelection()) {
                     builder.setGroupOperatingBand(mapOperatingBand(P2pConfig.PREFERRED_GROUP_BAND));
                 }
@@ -1318,6 +1327,18 @@ public class FastDiscoveryManager {
         config.wps.setup = WpsInfo.PBC;
         config.groupOwnerIntent = 15;
         return config;
+    }
+
+    /**
+     * Похоже ли значение на настоящий MAC-адрес.
+     *
+     * <p>На Android 10+ настоящий P2P-адрес собеседника в списке пиров есть,
+     * но записи, созданные «по сокету» ({@code p2p:<id>}), MAC не содержат —
+     * для них {@code MacAddress.fromString} бросит исключение.
+     */
+    private static boolean isValidMac(String address) {
+        if (address == null) return false;
+        return address.matches("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$");
     }
 
     /** Одинаковое имя сети на обоих телефонах: {@code DIRECT-RD-<меньший>-<больший>}. */

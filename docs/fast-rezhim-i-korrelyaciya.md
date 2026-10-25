@@ -19,6 +19,7 @@
 
 | Возможность | Флаг | Значение по умолчанию |
 |---|---|---|
+| TCP-транспорт поверх группы | `ENABLE_P2P_SOCKET_TRANSPORT` | `true` |
 | Быстрый путь — основной | `SOCKET_IS_PRIMARY_PATH` | `true` |
 | Задержка TXT-резерва | `TXT_FALLBACK_DELAY_MS` | `1500` мс |
 | UDP-канал внутри группы | `ENABLE_GROUP_LINK_CHANNEL` | `true` |
