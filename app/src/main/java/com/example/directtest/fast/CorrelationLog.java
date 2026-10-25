@@ -285,14 +285,22 @@ public final class CorrelationLog {
         }
     }
 
-    /** Упрощённый вызов: событие без trace/peer. */
-    public void event(String event, String... kv) {
+    /**
+     * Упрощённый вызов: событие без trace и peer.
+     *
+     * ВАЖНО: метод назван {@code note}, а не {@code event}. Раньше здесь была
+     * перегрузка {@code event(String event, String... kv)}, и компилятор не мог
+     * выбрать между ней и {@code event(String, String, String, String...)} для
+     * вызовов вида {@code event(EV, null, null, "k", "v")} — javac отвечал
+     * «reference to event is ambiguous». Разные имена снимают проблему навсегда.
+     */
+    public void note(String event, String... kv) {
         event(event, null, null, kv);
     }
 
     /** Замер задержки: RTT/латентность доставки с привязкой к цепочке. */
     public void latency(String event, String trace, String peer, String phase, long ms) {
-        event(event, trace, peer, "phase", phase, "ms", String.valueOf(ms));
+        CorrelationLog.this.event(event, trace, peer, "phase", phase, "ms", String.valueOf(ms));
     }
 
     /** Снимок журнала в текстовом виде (для шаринга/просмотра). */
