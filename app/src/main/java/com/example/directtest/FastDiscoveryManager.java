@@ -1249,26 +1249,32 @@ public class FastDiscoveryManager {
         }
 
         lastGroupAttempt = now;
-        log.i("Initiating P2P group with " + best.getShortId() + " (" + best.address + ")");
 
-        WifiP2pConfig config = buildGroupConfig(best);
+        // best переприсваивается в цикле выше, поэтому в анонимный
+        // ActionListener его захватить нельзя («must be final or effectively
+        // final»). Копируем в final-переменную: дальше используется только она.
+        final DiscoveredDevice peer = best;
 
-        corr.event(CorrelationLog.EV_GRP_UP, null, best.deviceId,
+        log.i("Initiating P2P group with " + peer.getShortId() + " (" + peer.address + ")");
+
+        WifiP2pConfig config = buildGroupConfig(peer);
+
+        corr.event(CorrelationLog.EV_GRP_UP, null, peer.deviceId,
                 "state", "connecting",
                 "persistent", String.valueOf(P2pConfig.ENABLE_PERSISTENT_GROUP && HwGuard.supportsPersistentGroup()),
                 "band", String.valueOf(P2pConfig.PREFERRED_GROUP_BAND),
-                "addr", String.valueOf(best.address));
+                "addr", String.valueOf(peer.address));
 
         manager.connect(channel, config, new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
-                log.success("P2P connect initiated to " + best.getShortId());
+                log.success("P2P connect initiated to " + peer.getShortId());
             }
 
             @Override
             public void onFailure(int reason) {
                 log.w("P2P connect failed: " + reasonToString(reason));
-                corr.event(CorrelationLog.EV_GRP_DOWN, null, best.deviceId,
+                corr.event(CorrelationLog.EV_GRP_DOWN, null, peer.deviceId,
                         "state", "connect-failed", "reason", reasonToString(reason));
             }
         });
