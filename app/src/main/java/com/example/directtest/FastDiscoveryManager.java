@@ -1,7 +1,6 @@
 package com.example.directtest;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Collections;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -199,6 +198,39 @@ public class FastDiscoveryManager {
 
     /** Предупреждение «радио недоступно» пишем один раз на переход, а не каждый цикл. */
     private volatile boolean radioWarningLogged = false;
+
+    /** Когда радио впервые показалось недоступным (0 — доступно). */
+    private volatile long radioBlockedSince = 0;
+
+    /**
+     * Когда последний раз discoverPeers завершился успехом.
+     *
+     * Нужен, чтобы отличить «список пиров свежий, можно сэкономить и обновить
+     * только сервисы» от «в кэше только сохранённые с прошлой сессии записи» —
+     * во втором случае экономить нельзя, нужен полный проход.
+     */
+    private volatile long lastPeersDiscoverOk = 0;
+
+    /**
+     * Адреса, реально увиденные в этой сессии (discoverPeers/requestPeers).
+     *
+     * Кэш устройств наполняется ещё и из сохранённой истории
+     * ({@link #loadSavedDevicesToCache()}), но там адреса Wi-Fi Direct с прошлой
+     * сессии. На Android 10+ адрес рандомизирован, поэтому connect() по такому
+     * адресу гарантированно провалится и может расстроить supplicant —
+     * инициировать группу разрешено только по подтверждённому адресу.
+     */
+    private final Set<String> sessionConfirmedAddresses =
+            Collections.synchronizedSet(new HashSet<>());
+
+    /** Стек обнаружения (listeners + запросы + периодика) уже запущен. */
+    private volatile boolean discoveryStackStarted = false;
+
+    /** Сколько подряд неудачных попыток connect — для экспоненциальной паузы. */
+    private volatile int groupInitFailures = 0;
+
+    /** Последняя неудачная попытка connect (мс). */
+    private volatile long lastGroupFailureAt = 0;
 
     /**
      * Номер текущей цепочки поиска. Старые цепочки повторов (forceRefresh,
@@ -504,6 +536,14 @@ public class FastDiscoveryManager {
 
         // Освобождаем WiFi Lock
         releaseWifiLock();
+
+        discoveryStackStarted = false;
+        sessionConfirmedAddresses.clear();
+        groupInitFailures = 0;
+        lastPeersDiscoverOk = 0;
+        radioBlockedSince = 0;
+        handler.removeCallbacks(ensureDiscoveryRunnable);
+        handler.removeCallbacks(discoverySafetyRunnable);
 
         messageSlots.clear();
         reservedSlots.clear();
@@ -1026,17 +1066,69 @@ public class FastDiscoveryManager {
     private void setupDiscovery() {
         log.divider("SETUP DISCOVERY");
         setupServiceListeners();
+
+        /* Запуск поиска НЕ должен зависеть от успеха addLocalService.
+           Раньше вся цепочка (service requests → периодика → поиск) висела на
+           колбэке регистрации WFD_Main: если регистрация не удалась (BUSY,
+           выключенное радио, капризная прошивка), поиск не стартовал вообще.
+           Теперь есть страховка: через ENSURING_DELAY мс стек запускается
+           принудительно, если ещё не запущен. */
+        scheduleDiscoveryStackEnsure();
+
         registerMainService(() -> {
             addServiceRequests(() -> {
-                startDiscoverySequence();
+                startDiscoveryStack("main-service-ready");
             });
         });
     }
 
-    private void startDiscoverySequence() {
+    /** Однократный запуск стека обнаружения: запросы сервисов + периодика. */
+    private void startDiscoveryStack(String reason) {
+        if (!isRunning) return;
+        if (discoveryStackStarted) {
+            requestDiscovery(reason);
+            return;
+        }
+        discoveryStackStarted = true;
+        handler.removeCallbacks(ensureDiscoveryRunnable);
+        log.success("Discovery stack started (" + reason + ")");
+        corr.event(CorrelationLog.EV_START, null, null,
+                "component", "discovery-stack", "reason", reason);
+
         schedulePeriodicTasks();
         requestDiscovery("start");
     }
+
+    private static final long ENSURE_STACK_DELAY_MS = 4_000;
+
+    private void scheduleDiscoveryStackEnsure() {
+        handler.removeCallbacks(ensureDiscoveryRunnable);
+        handler.postDelayed(ensureDiscoveryRunnable, ENSURE_STACK_DELAY_MS);
+    }
+
+    /**
+     * Страховка запуска: если через {@link #ENSURE_STACK_DELAY_MS} стек ещё не
+     * запущен (регистрация сервиса не ответила, колбэк потерялся), запускаем
+     * его без сервиса и повторяем попытку регистрации в фоне.
+     */
+    private final Runnable ensureDiscoveryRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning) return;
+            if (discoveryStackStarted) return;
+
+            log.w("Discovery stack not started yet — forcing start");
+            corr.event(CorrelationLog.EV_ERROR, null, null,
+                    "where", "ensure-discovery-stack");
+            startDiscoveryStack("watchdog");
+
+            // Регистрацию сервиса повторяем отдельно: без WFD_Main собеседник
+            // не увидит нас как «своё» приложение, но поиск уже работает.
+            if (mainServiceInfo == null) {
+                registerMainService(() -> { });
+            }
+        }
+    };
 
     // ==================== SOCKET TRANSPORT (ЭТАП 4) ====================
 
@@ -1261,16 +1353,34 @@ public class FastDiscoveryManager {
      */
     private void maybeInitiateGroup() {
         if (socketTransport == null || !P2pConfig.ENABLE_P2P_SOCKET_TRANSPORT) return;
+        if (!P2pConfig.ENABLE_GROUP_INITIATION) return;
         if (groupFormed || socketTransport.getConnectedCount() > 0) return;
 
+        // connect() при недоступном радио только расстраивает supplicant.
+        if (!isRadioReady()) return;
+
         long now = System.currentTimeMillis();
-        if (now - lastGroupAttempt < P2pConfig.GROUP_RETRY_INTERVAL_MS) return;
+
+        // Экспоненциальная пауза после неудач: на части прошивок частая
+        // попытка connect() сама мешает обнаружению новых устройств.
+        long backoff = P2pConfig.GROUP_RETRY_INTERVAL_MS;
+        if (groupInitFailures > 0) {
+            backoff = Math.min(
+                    P2pConfig.GROUP_INIT_BACKOFF_BASE_MS << Math.min(groupInitFailures, 3),
+                    P2pConfig.GROUP_RETRY_INTERVAL_MS * 8);
+        }
+        long sinceAttempt = Math.max(now - lastGroupAttempt, 0);
+        if (lastGroupAttempt != 0 && sinceAttempt < backoff) return;
 
         DiscoveredDevice best = null;
         for (DiscoveredDevice dd : deviceCache.values()) {
             if (!dd.hasOurApp || dd.deviceId == null || dd.deviceId.length() < 8) continue;
             if (!dd.isOnline()) continue;
             if (dd.address == null || dd.address.startsWith("p2p:")) continue;
+            // Только адрес, реально увиденный в этой сессии. Сохранённый
+            // с прошлой сессии адрес на Android 10+ уже недействителен
+            // (рандомизация MAC) — connect() по нему провалится.
+            if (!sessionConfirmedAddresses.contains(dd.address)) continue;
             if (best == null || dd.deviceId.compareTo(best.deviceId) < 0) {
                 best = dd;
             }
@@ -1302,14 +1412,26 @@ public class FastDiscoveryManager {
         manager.connect(channel, config, new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
+                groupInitFailures = 0;
                 log.success("P2P connect initiated to " + peer.getShortId());
             }
 
             @Override
             public void onFailure(int reason) {
-                log.w("P2P connect failed: " + reasonToString(reason));
+                groupInitFailures++;
+                lastGroupFailureAt = System.currentTimeMillis();
+                log.w("P2P connect failed: " + reasonToString(reason)
+                        + " (failures=" + groupInitFailures + ")");
                 corr.event(CorrelationLog.EV_GRP_DOWN, null, peer.deviceId,
-                        "state", "connect-failed", "reason", reasonToString(reason));
+                        "state", "connect-failed", "reason", reasonToString(reason),
+                        "failures", String.valueOf(groupInitFailures));
+
+                // Группа не сложилась — работаем по TXT и не мешаем поиску:
+                // возвращаемся к нормальному ритму discovery.
+                if (groupInitFailures >= 3) {
+                    log.w("Group initiation keeps failing — staying on TXT transport");
+                    notifyStatus("Быстрый канал недоступен, работаем через DNS-SD");
+                }
             }
         });
     }
@@ -3032,6 +3154,31 @@ public class FastDiscoveryManager {
             wifiCheckedAt = now;
             wifiEnabledCache = HwGuard.isWifiEnabled(context);
         }
+
+        boolean ready = wifiEnabledCache && p2pStateEnabled;
+
+        // Самовосстановление: прошивка может не прислать broadcast о включении
+        // Wi-Fi/P2P. Если «недоступно» висит дольше RADIO_SELF_HEAL_MS, но Wi-Fi
+        // уже включён — сбрасываем флаг и пробуем снова, иначе поиск остался бы
+        // выключенным навсегда.
+        if (ready) {
+            radioBlockedSince = 0;
+            return true;
+        }
+
+        if (radioBlockedSince == 0) {
+            radioBlockedSince = now;
+        } else if (now - radioBlockedSince > P2pConfig.RADIO_SELF_HEAL_MS && wifiEnabledCache) {
+            log.w("Radio gate stuck for " + (now - radioBlockedSince)
+                    + "ms while Wi-Fi is ON — self-heal, retrying");
+            corr.event(CorrelationLog.EV_ENV, null, null,
+                    "self_heal", "radio-gate", "wifi", "1",
+                    "p2p", p2pStateEnabled ? "1" : "0");
+            p2pStateEnabled = true;
+            radioBlockedSince = 0;
+            radioWarningLogged = false;
+        }
+
         return wifiEnabledCache && p2pStateEnabled;
     }
 
@@ -3082,9 +3229,24 @@ public class FastDiscoveryManager {
             notifyStatus("Поиск возобновлён");
         }
 
-        long now = System.currentTimeMillis();
-        long sinceLast = now - lastDiscoverCall;
-        long gap = priority ? P2pConfig.PRIORITY_DISCOVER_GAP_MS
+        final long now = System.currentTimeMillis();
+        final long sinceLast = now - lastDiscoverCall;
+
+        /* A2: «лёгкий» проход (только discoverServices) допустим, лишь когда
+           список пиров действительно свежий. Раньше условием было просто
+           «кэш не пуст», а он наполняется и сохранёнными устройствами с
+           прошлой сессии — из-за этого discoverPeers мог вообще не вызываться,
+           и новые телефоны не находились. */
+        long peersAge = lastPeersDiscoverOk == 0
+                ? Long.MAX_VALUE : (now - lastPeersDiscoverOk);
+        boolean peersFresh = peersAge < P2pConfig.PEERS_FRESH_MS;
+        boolean servicesOnly = priority && peersFresh && !deviceCache.isEmpty();
+
+        /* Полный проход (с discoverPeers) всегда уважает MIN_DISCOVER_GAP_MS:
+           слишком частый discoverPeers на части прошивок обрывает текущий
+           поиск, и результаты теряются. Быстрый порог — только для лёгкого
+           прохода, который пиры не сканирует. */
+        long gap = servicesOnly ? P2pConfig.PRIORITY_SERVICES_ONLY_GAP_MS
                 : P2pConfig.MIN_DISCOVER_GAP_MS;
 
         // D1: без включённого Location Mode discovery на MIUI/Funtouch
@@ -3110,18 +3272,20 @@ public class FastDiscoveryManager {
         discoveryPhase++;
         final int generation = discoveryGeneration.incrementAndGet();
 
-        boolean servicesOnly = priority && !deviceCache.isEmpty();
+        final long effectivePeriod = currentWindowPeriod();
         log.d("Discovery requested: " + reason
                 + (priority ? " [priority]" : "")
-                + (servicesOnly ? " [services-only]" : "")
-                + " | window=" + SyncWindow.describe(now));
+                + (servicesOnly ? " [services-only]" : " [full]")
+                + " | window=" + SyncWindow.describe(now, effectivePeriod)
+                + " | peersAge=" + (peersAge == Long.MAX_VALUE ? "never" : peersAge + "ms"));
 
         corr.event(CorrelationLog.EV_DISC_REQ, null, null,
                 "reason", reason,
                 "prio", priority ? "1" : "0",
                 "phase", String.valueOf(discoveryPhase),
-                "window", SyncWindow.describe(now),
+                "window", SyncWindow.describe(now, effectivePeriod),
                 "peers", String.valueOf(deviceCache.size()),
+                "peers_age_ms", peersAge == Long.MAX_VALUE ? "-1" : String.valueOf(peersAge),
                 "services_only", servicesOnly ? "1" : "0");
 
         // Сторож: если колбэк discoverServices не придёт (зависший supplicant,
@@ -3137,6 +3301,7 @@ public class FastDiscoveryManager {
         manager.discoverPeers(channel, new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
+                lastPeersDiscoverOk = System.currentTimeMillis();
                 log.d("discoverPeers started (" + reason + ")");
                 corr.event(CorrelationLog.EV_DISC_RES, null, null,
                         "phase", "peers", "result", "ok", "reason", reason);
@@ -3329,8 +3494,12 @@ public class FastDiscoveryManager {
         // опрос списка пиров (A4). Оба не запускают сканирование сами по себе.
         handler.removeCallbacks(syncWindowRunnable);
         handler.removeCallbacks(peersPollRunnable);
+        handler.removeCallbacks(discoverySafetyRunnable);
+        handler.removeCallbacks(discoveryHealthRunnable);
         handler.postDelayed(syncWindowRunnable, SyncWindow.msUntilOpen(System.currentTimeMillis()) + 50);
         handler.postDelayed(peersPollRunnable, P2pConfig.PEERS_POLL_INTERVAL_MS);
+        handler.postDelayed(discoverySafetyRunnable, DISCOVERY_SAFETY_MS);
+        handler.postDelayed(discoveryHealthRunnable, 30_000);
 
         // ВАЖНО: dnsCacheResetRunnable (clearServiceRequests каждые 45 с) и
         // serviceReregisterRunnable (remove+add всех сервисов каждые 30 с)
@@ -3357,23 +3526,41 @@ public class FastDiscoveryManager {
             if (!isRunning) return;
 
             long now = System.currentTimeMillis();
-            boolean open = SyncWindow.isOpen(now);
+            long period = currentWindowPeriod();
+            boolean open = SyncWindow.isOpen(now, period);
 
             if (open) {
                 corr.event(CorrelationLog.EV_WINDOW, null, null,
                         "state", "open",
-                        "phase_ms", String.valueOf(SyncWindow.phase(now)),
+                        "period_ms", String.valueOf(period),
+                        "phase_ms", String.valueOf(SyncWindow.phase(now, period)),
+                        "pending", hasPendingWork() ? "1" : "0",
                         "skew_ms", String.valueOf(peerClock.offset(myPeerId())));
                 requestDiscovery("sync-window", true);
 
-                long delay = SyncWindow.msUntilClose(now)
-                        + (P2pConfig.SYNC_WINDOW_PERIOD_MS - P2pConfig.SYNC_WINDOW_LENGTH_MS) + 50;
+                long delay = SyncWindow.msUntilClose(now, period)
+                        + (period - P2pConfig.SYNC_WINDOW_LENGTH_MS) + 50;
                 handler.postDelayed(this, delay);
             } else {
-                handler.postDelayed(this, SyncWindow.msUntilOpen(now) + 50);
+                handler.postDelayed(this, SyncWindow.msUntilOpen(now, period) + 50);
             }
         }
     };
+
+    /**
+     * Частые окна нужны только когда есть что доставлять (неподтверждённые
+     * сообщения или ожидающие ACK). В покое работаем в прежнем темпе:
+     * лишние discover-вызовы мешают нормальному поиску на части прошивок.
+     */
+    private long currentWindowPeriod() {
+        return hasPendingWork() ? P2pConfig.SYNC_WINDOW_PERIOD_MS
+                : P2pConfig.SYNC_WINDOW_IDLE_PERIOD_MS;
+    }
+
+    private boolean hasPendingWork() {
+        return !pendingMessages.isEmpty() || !pendingAcksToSend.isEmpty()
+                || !pendingTxtFallbacks.isEmpty();
+    }
 
     /**
      * A4: дешёвый опрос пиров.
@@ -3402,6 +3589,10 @@ public class FastDiscoveryManager {
 
                     if (device.deviceName != null && device.deviceName.contains(P2pConfig.APP_MARKER)) {
                         dd.hasOurApp = true;
+                        // Адрес увиден в этой сессии и на устройстве есть наше
+                        // приложение — по нему можно инициировать группу
+                        // (сохранённые адреса не годятся: MAC рандомизирован).
+                        sessionConfirmedAddresses.add(device.deviceAddress);
                         String extracted = extractDeviceIdFromName(device.deviceName);
                         if (extracted != null && dd.deviceId == null) {
                             bindDeviceIdentity(dd, extracted);
@@ -3539,6 +3730,77 @@ public class FastDiscoveryManager {
         }
     };
 
+    /**
+     * Страховка жизнеспособности поиска.
+     *
+     * <p>Все цепочки поиска асинхронные: колбэк может не прийти, цепочка может
+     * быть отброшена как устаревшая, повтор — отменён. В норме следующая
+     * итерация планируется из колбэка, но если колбэк потерялся, поиск
+     * замолкает навсегда. Этот сторож раз в {@link #DISCOVERY_SAFETY_MS}
+     * проверяет: радио доступно, а поиска не было давно — тогда запускает
+     * полный проход.
+     */
+    private static final long DISCOVERY_SAFETY_MS = 10_000;
+    private static final long DISCOVERY_STALE_MS = 20_000;
+
+    private final Runnable discoverySafetyRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning) return;
+
+            long now = System.currentTimeMillis();
+            boolean stale = lastDiscoveryTime == 0 || now - lastDiscoveryTime > DISCOVERY_STALE_MS;
+
+            if (stale && isRadioReady() && !discoveryInProgress) {
+                log.w("Discovery loop stalled for "
+                        + (lastDiscoveryTime == 0 ? "ever" : (now - lastDiscoveryTime) + "ms")
+                        + " — restarting");
+                corr.event(CorrelationLog.EV_DISC_REQ, null, null,
+                        "reason", "safety", "result", "stalled");
+                lastDiscoverCall = 0;          // снимаем троттлинг
+                discoveryGeneration.incrementAndGet();
+                performDiscovery();
+            }
+
+            handler.postDelayed(this, DISCOVERY_SAFETY_MS);
+        }
+    };
+
+    /** Периодическая сводка здоровья поиска — по ней видно, где затык. */
+    private final Runnable discoveryHealthRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isRunning) return;
+
+            long now = System.currentTimeMillis();
+            int withApp = 0;
+            for (DiscoveredDevice dd : deviceCache.values()) {
+                if (dd.hasOurApp) withApp++;
+            }
+            long peersAge = lastPeersDiscoverOk == 0 ? -1 : (now - lastPeersDiscoverOk);
+
+            log.i("[HEALTH] radio=" + (isRadioReady() ? "ready" : "off")
+                    + " peers=" + deviceCache.size() + " withApp=" + withApp
+                    + " peersScanAge=" + (peersAge < 0 ? "never" : peersAge + "ms")
+                    + " discoveryAge=" + (lastDiscoveryTime == 0 ? "never"
+                    : (now - lastDiscoveryTime) + "ms")
+                    + " stack=" + discoveryStackStarted
+                    + " inflight=" + discoveryInProgress
+                    + " group=" + groupFormed
+                    + " failConnect=" + groupInitFailures);
+
+            corr.event(CorrelationLog.EV_ENV, null, null,
+                    "health", "discovery",
+                    "peers", String.valueOf(deviceCache.size()),
+                    "with_app", String.valueOf(withApp),
+                    "peers_age_ms", String.valueOf(peersAge),
+                    "stack", discoveryStackStarted ? "1" : "0",
+                    "group", groupFormed ? "1" : "0");
+
+            handler.postDelayed(this, 30_000);
+        }
+    };
+
     private void performDiscovery() {
         requestDiscovery("periodic");
 
@@ -3627,10 +3889,19 @@ public class FastDiscoveryManager {
                 dd.name = parts.length > 1 ? parts[1] : nameWithoutMarker;
             }
 
+            // В сессию «подтверждённых» попадают только устройства, у которых
+            // реально есть наше приложение (маркер в имени) — иначе мы рискуем
+            // инициировать группу к чужому/старому устройству из кеша.
+            if (dd.hasOurApp) {
+                sessionConfirmedAddresses.add(address);
+            }
             deviceCache.put(address, dd);
             notifyDeviceFound(dd);
             onNewDeviceFound();
         } else {
+            if (dd.hasOurApp) {
+                sessionConfirmedAddresses.add(address);
+            }
             dd.device = device;
             dd.lastSeen = System.currentTimeMillis();
             dd.seenCount++;

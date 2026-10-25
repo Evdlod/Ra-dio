@@ -282,6 +282,17 @@ public final class P2pConfig {
     public static final long PRIORITY_DISCOVER_GAP_MS = 800;
 
     /**
+     * Минимальный интервал для «лёгкого» прохода (только discoverServices).
+     *
+     * Полный проход (с discoverPeers) стоит дороже: он перезапускает
+     * сканирование и на части прошивок обрывает уже начатый поиск. Поэтому
+     * порог {@link #PRIORITY_DISCOVER_GAP_MS} применяется ТОЛЬКО к проходам
+     * без discoverPeers; полные проходы всегда уважают
+     * {@link #MIN_DISCOVER_GAP_MS}.
+     */
+    public static final long PRIORITY_SERVICES_ONLY_GAP_MS = 800;
+
+    /**
      * Длительность одной фазы поиска (мс), A2.
      * Внутри фазы вызывается только что-то одно: либо discoverPeers, либо
      * discoverServices. Так supplicant не получает две команды подряд и не
@@ -297,6 +308,25 @@ public final class P2pConfig {
     /** Длительность окна поиска (мс). */
     public static final long SYNC_WINDOW_LENGTH_MS = 2_000;
 
+    /**
+     * Период окон, когда торопиться некуда (нет неподтверждённых сообщений).
+     *
+     * Частые окна нужны только чтобы быстро доставить/подтвердить сообщение.
+     * В покое они лишь дёргают supplicant — на части прошивок это мешает
+     * нормальному поиску. В покое работаем в прежнем темпе (8 с).
+     */
+    public static final long SYNC_WINDOW_IDLE_PERIOD_MS = 8_000;
+
+    /**
+     * Сколько миллисекунд список пиров считается «свежим».
+     *
+     * Только при свежем списке приоритетный проход может ограничиться
+     * discoverServices (A2). Иначе обязателен полный проход с discoverPeers —
+     * иначе на «холодном» кэше (сохранённые устройства с прошлой сессии)
+     * новые телефоны не находятся вовсе.
+     */
+    public static final long PEERS_FRESH_MS = 10_000;
+
     // ==================== A4: ДЕШЁВЫЙ ОПРОС ПИРОВ ====================
 
     /**
@@ -306,7 +336,7 @@ public final class P2pConfig {
      * не запускает сканирование, BUSY не возвращается. Позволяет замечать
      * собеседника, которого нашёл сам собеседник, не дожидаясь своего поиска.
      */
-    public static final long PEERS_POLL_INTERVAL_MS = 2_000;
+    public static final long PEERS_POLL_INTERVAL_MS = 3_000;
 
     // ==================== A5/A6: ГРУППА ====================
 
@@ -425,6 +455,30 @@ public final class P2pConfig {
      * На MIUI/Funtouch без него discoverPeers возвращает пустой список.
      */
     public static final boolean REQUIRE_LOCATION_FOR_DISCOVERY = true;
+
+    /**
+     * Через сколько миллисекунд «радио недоступно» перепроверяется принудительно.
+     *
+     * Защита от залипания: прошивка может не прислать broadcast о включении
+     * Wi-Fi/P2P, и тогда гейт остановил бы поиск навсегда. По истечении этого
+     * времени делается пробный проход и состояние перечитывается.
+     */
+    public static final long RADIO_SELF_HEAL_MS = 15_000;
+
+    /**
+     * Разрешить приложению инициировать P2P-группу (connect).
+     *
+     * Выключается, если на прошивке формирование группы мешает обнаружению:
+     * тогда приложение работает только по TXT-пути, как в версии 4.
+     */
+    public static final boolean ENABLE_GROUP_INITIATION = true;
+
+    /**
+     * Минимальная пауза между неудачными попытками connect (мс).
+     * Каждая следующая неудача удваивает паузу до {@link #GROUP_RETRY_INTERVAL_MS} × 8,
+     * чтобы не долбить supplicant, пока собеседник реально не готов.
+     */
+    public static final long GROUP_INIT_BACKOFF_BASE_MS = 5_000;
 
     /**
      * Период обновления основной записи WFD_Main (мс), D8.
