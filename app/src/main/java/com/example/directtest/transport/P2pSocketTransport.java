@@ -391,12 +391,6 @@ public class P2pSocketTransport {
                 pc.peerId = CorrelationLog.shortId(hello.deviceId);
                 peers.put(pc.peerId, pc);
 
-                if (hello.utcMs > 0) {
-                    // Оценка расхождения часов: полпути неизвестно, берём 0,
-                    // уточняется после ping/pong.
-                    // (PeerClock обновляет менеджер — он владеет общей картиной.)
-                }
-
                 log.success(TAG + " peer connected: " + pc.peerId);
                 corr.event(CorrelationLog.EV_LINK_UP, null, pc.peerId, "channel", "tcp");
                 Callback cb = callback;
