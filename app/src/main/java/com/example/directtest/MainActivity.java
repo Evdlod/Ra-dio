@@ -52,6 +52,9 @@ public class MainActivity extends AppCompatActivity implements DiscoveryService.
     /** D1: предупреждение о выключенной геолокации показываем один раз за запуск. */
     private boolean locationWarningShown = false;
 
+    /** Диалог «Wi-Fi выключен» — один раз за запуск. */
+    private boolean wifiDialogShown = false;
+
     // Периодическое обновление UI
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private final Runnable uiUpdateRunnable = new Runnable() {
@@ -594,6 +597,26 @@ public class MainActivity extends AppCompatActivity implements DiscoveryService.
     @Override
     public void onError(String message) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
+
+        // Wi-Fi выключен — это единственная ошибка, которую пользователь может
+        // исправить одним нажатием. Показываем диалог с переходом в настройки,
+        // но не чаще одного раза за запуск (иначе он перекроет экран).
+        if (!wifiDialogShown && message != null
+                && (message.contains("Wi-Fi") || message.toLowerCase(Locale.US).contains("wifi"))) {
+            wifiDialogShown = true;
+            new AlertDialog.Builder(this)
+                    .setTitle("Wi-Fi выключен")
+                    .setMessage("Wi-Fi Direct работает только при включённом Wi-Fi. "
+                            + "Включите Wi-Fi — поиск и приём сообщений возобновятся автоматически.")
+                    .setPositiveButton("Открыть настройки", (d, w) -> {
+                        try {
+                            com.example.directtest.fast.HwGuard.openWifiSettings(this);
+                        } catch (Exception ignored) {
+                        }
+                    })
+                    .setNegativeButton("Позже", null)
+                    .show();
+        }
     }
 
     // ==================== ADAPTER ====================

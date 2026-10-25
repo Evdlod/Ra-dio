@@ -181,6 +181,32 @@ public class FastDiscoveryManager {
     /** Счётчик фаз поиска для чередования discoverPeers/discoverServices (A2). */
     private volatile int discoveryPhase = 0;
 
+    // ==================== СОСТОЯНИЕ РАДИО ====================
+
+    /**
+     * П2P разрешён по последнему broadcast {@code WIFI_P2P_STATE_CHANGED}.
+     *
+     * Пока Wi-Fi выключен, система отвечает BUSY на любую команду supplicant'а.
+     * Без этого флага приложение продолжает опрашивать радио каждые несколько
+     * секунд, забивает лог одинаковыми BUSY и жжёт батарею — ровно это видно
+     * в логах с выключенным Wi-Fi.
+     */
+    private volatile boolean p2pStateEnabled = true;
+
+    /** Кэш состояния Wi-Fi: {@code isWifiEnabled()} — вызов в систему, не чаще раза в секунду. */
+    private volatile boolean wifiEnabledCache = true;
+    private volatile long wifiCheckedAt = 0;
+
+    /** Предупреждение «радио недоступно» пишем один раз на переход, а не каждый цикл. */
+    private volatile boolean radioWarningLogged = false;
+
+    /**
+     * Номер текущей цепочки поиска. Старые цепочки повторов (forceRefresh,
+     * periodic) при этом прекращаются, иначе в эфире одновременно живут
+     * несколько независимых циклов и каждый получает BUSY.
+     */
+    private final AtomicInteger discoveryGeneration = new AtomicInteger();
+
     // ==================== CONSTRUCTOR ====================
 
     public FastDiscoveryManager(Context context) {
@@ -839,6 +865,14 @@ public class FastDiscoveryManager {
      */
     public void forceRefresh() {
         if (!isRunning) return;
+
+        // Уже идёт поиск (например, его только что запустил другой источник) —
+        // новый вызов дал бы BUSY и второй параллельный цикл повторов.
+        if (discoveryInProgress) {
+            log.d("forceRefresh skipped: discovery already in progress");
+            return;
+        }
+
         log.divider("FORCE REFRESH");
         lastDiscoverCall = 0;            // разрешаем немедленный проход
         handler.removeCallbacks(discoveryRunnable);
@@ -1551,6 +1585,14 @@ public class FastDiscoveryManager {
     }
 
     private void registerMainService(Runnable onComplete, int attempt) {
+        // Wi-Fi выключен — addLocalService гарантированно вернёт BUSY. Повторы
+        // здесь только жгут батарею; регистрация возобновится сама, когда
+        // придёт broadcast «P2P включён» (initializeAndStart).
+        if (!isRadioReady()) {
+            onRadioUnavailable("register-main-service");
+            return;
+        }
+
         Map<String, String> record = buildMainServiceRecord();
 
         log.divider("REGISTER MAIN SERVICE");
@@ -1573,6 +1615,10 @@ public class FastDiscoveryManager {
             public void onFailure(int reason) {
                 log.error("FAILED to register main service: " + reasonToString(reason)
                         + " (attempt " + attempt + ")");
+                if (!isRadioReady()) {
+                    onRadioUnavailable("register-main-service");
+                    return;
+                }
                 long delay = P2pConfig.DISCOVER_RETRY_BASE_MS << Math.min(attempt, 3);
                 if (attempt < 5) {
                     handler.postDelayed(() -> registerMainService(onComplete, attempt + 1), delay);
@@ -1687,6 +1733,13 @@ public class FastDiscoveryManager {
 
     private void updateMainService() {
         if (!isRunning) return;
+
+        // Радио недоступно: heartbeat молчит (и не пытается перерегистрировать
+        // сервис), иначе каждые 5 секунд получаем BUSY и шум в логе.
+        if (!isRadioReady()) {
+            onRadioUnavailable("heartbeat");
+            return;
+        }
 
         // Если сервис не зарегистрирован (например, все попытки провалились),
         // heartbeat должен восстановить его, а не молча простаивать.
@@ -2968,6 +3021,40 @@ public class FastDiscoveryManager {
     }
 
     /**
+     * Доступно ли радио прямо сейчас: Wi-Fi включён и P2P не в состоянии DISABLED.
+     *
+     * <p>Если радио недоступно, обращаться к supplicant'у бессмысленно — он
+     * вернёт BUSY (именно это и забивало лог при выключенном Wi-Fi).
+     */
+    private boolean isRadioReady() {
+        long now = System.currentTimeMillis();
+        if (now - wifiCheckedAt > 1000) {
+            wifiCheckedAt = now;
+            wifiEnabledCache = HwGuard.isWifiEnabled(context);
+        }
+        return wifiEnabledCache && p2pStateEnabled;
+    }
+
+    /**
+     * Единая реакция на «радио недоступно»: один раз предупредить, один раз
+     * записать в журнал корреляции, сбросить флаг «идёт поиск».
+     */
+    private void onRadioUnavailable(String reason) {
+        discoveryInProgress = false;
+        if (radioWarningLogged) return;
+        radioWarningLogged = true;
+
+        String problem = HwGuard.environmentProblem(context);
+        log.w("Radio unavailable (" + reason + "), discovery paused"
+                + (problem != null ? ": " + problem : ""));
+        notifyStatus(problem != null ? problem : "Wi-Fi недоступен — поиск приостановлен");
+        corr.event(CorrelationLog.EV_DISC_REQ, null, null,
+                "reason", reason, "result", "radio-off",
+                "wifi", HwGuard.isWifiEnabled(context) ? "1" : "0",
+                "p2p", p2pStateEnabled ? "1" : "0");
+    }
+
+    /**
      * Запрос поиска с приоритетом (A1) и фазовым разделением (A2).
      *
      * <p>Отличие приоритетного запроса: нижняя граница интервала —
@@ -2982,6 +3069,18 @@ public class FastDiscoveryManager {
      */
     private void requestDiscovery(String reason, boolean priority) {
         if (!isRunning || manager == null || channel == null) return;
+
+        // Радио выключено (Wi-Fi off / P2P DISABLED): supplicant вернёт BUSY на
+        // любую команду. Ничего не отправляем и никаких повторов не заводим.
+        if (!isRadioReady()) {
+            onRadioUnavailable(reason);
+            return;
+        }
+        if (radioWarningLogged) {
+            radioWarningLogged = false;
+            log.success("Radio is back, resuming discovery");
+            notifyStatus("Поиск возобновлён");
+        }
 
         long now = System.currentTimeMillis();
         long sinceLast = now - lastDiscoverCall;
@@ -3009,6 +3108,7 @@ public class FastDiscoveryManager {
         discoveryInProgress = true;
         lastDiscoveryTime = now;
         discoveryPhase++;
+        final int generation = discoveryGeneration.incrementAndGet();
 
         boolean servicesOnly = priority && !deviceCache.isEmpty();
         log.d("Discovery requested: " + reason
@@ -3030,7 +3130,7 @@ public class FastDiscoveryManager {
         handler.postDelayed(discoveryWatchdog, 20_000);
 
         if (servicesOnly) {
-            discoverServicesWithRetry(reason, 0);
+            discoverServicesWithRetry(reason, 0, generation);
             return;
         }
 
@@ -3040,7 +3140,7 @@ public class FastDiscoveryManager {
                 log.d("discoverPeers started (" + reason + ")");
                 corr.event(CorrelationLog.EV_DISC_RES, null, null,
                         "phase", "peers", "result", "ok", "reason", reason);
-                handler.postDelayed(() -> discoverServicesWithRetry(reason, 0),
+                handler.postDelayed(() -> discoverServicesWithRetry(reason, 0, generation),
                         P2pConfig.DISCOVER_SERVICES_DELAY_MS);
             }
 
@@ -3050,7 +3150,7 @@ public class FastDiscoveryManager {
                 corr.event(CorrelationLog.EV_DISC_RES, null, null,
                         "phase", "peers", "result", reasonToString(r), "reason", reason);
                 // peers не критичен: сразу пробуем services
-                handler.postDelayed(() -> discoverServicesWithRetry(reason, 0), 300);
+                handler.postDelayed(() -> discoverServicesWithRetry(reason, 0, generation), 300);
             }
         });
     }
@@ -3059,12 +3159,27 @@ public class FastDiscoveryManager {
      * discoverServices с повтором при BUSY и экспоненциальной паузой.
      * Повтор через 500 мс (как было) гарантированно попадал в тот же BUSY.
      */
-    private void discoverServicesWithRetry(String reason, int attempt) {
+    private void discoverServicesWithRetry(String reason, int attempt, int generation) {
         if (!isRunning) return;
+
+        // Радио выключилось посреди цепочки — прекращаем, иначе каждый повтор
+        // вернёт BUSY и цепочка будет жить вечно.
+        if (!isRadioReady()) {
+            onRadioUnavailable(reason);
+            return;
+        }
+
+        // Пока шла пауза перед повтором, был запущен новый цикл поиска.
+        // Эта цепочка устарела: молча выходим и НЕ трогаем общий флаг.
+        if (generation != discoveryGeneration.get()) {
+            log.d("Stale discovery chain dropped (" + reason + ", attempt " + attempt + ")");
+            return;
+        }
 
         manager.discoverServices(channel, new WifiP2pManager.ActionListener() {
             @Override
             public void onSuccess() {
+                if (generation != discoveryGeneration.get()) return;
                 discoveryInProgress = false;
                 handler.removeCallbacks(discoveryWatchdog);
                 log.d("discoverServices started (" + reason + ", attempt " + attempt + ")");
@@ -3077,6 +3192,7 @@ public class FastDiscoveryManager {
 
             @Override
             public void onFailure(int r) {
+                if (generation != discoveryGeneration.get()) return;
                 discoveryInProgress = false;
                 log.w("discoverServices failed: " + reasonToString(r)
                         + " (" + reason + ", attempt " + attempt + ")");
@@ -3084,10 +3200,18 @@ public class FastDiscoveryManager {
                         "phase", "services", "result", reasonToString(r),
                         "attempt", String.valueOf(attempt), "reason", reason);
 
+                // Пока supplicant отвечает BUSY из-за выключенного Wi-Fi,
+                // повторы бессмысленны: они сами создают нагрузку и шум в логе.
+                if (r == WifiP2pManager.BUSY && !isRadioReady()) {
+                    onRadioUnavailable(reason);
+                    return;
+                }
+
                 if (r == WifiP2pManager.BUSY && attempt < P2pConfig.DISCOVER_MAX_RETRIES) {
                     long delay = P2pConfig.DISCOVER_RETRY_BASE_MS << attempt;
                     log.d("Retrying discoverServices in " + delay + "ms");
-                    handler.postDelayed(() -> discoverServicesWithRetry(reason, attempt + 1), delay);
+                    handler.postDelayed(
+                            () -> discoverServicesWithRetry(reason, attempt + 1, generation), delay);
                     return;
                 }
 
@@ -3451,6 +3575,10 @@ public class FastDiscoveryManager {
                 .append("\n");
         sb.append("TXT fallback pending: ").append(pendingTxtFallbacks.size()).append("\n");
         sb.append("Relay cache: ").append(relayCache.size()).append("\n");
+        sb.append("Radio: wifi=").append(HwGuard.isWifiEnabled(context) ? "ON" : "OFF")
+                .append(" p2p=").append(p2pStateEnabled ? "ON" : "OFF")
+                .append(" ready=").append(isRadioReady())
+                .append(" generation=").append(discoveryGeneration.get()).append("\n");
         sb.append("Discovery window: ")
                 .append(SyncWindow.describe(System.currentTimeMillis()))
                 .append(" (period=").append(P2pConfig.SYNC_WINDOW_PERIOD_MS)
@@ -3702,12 +3830,21 @@ public class FastDiscoveryManager {
                     notifyError("WiFi P2P is disabled");
                     logDiagnosticState("WIFI_P2P_DISABLED");
 
-                    // Останавливаем периодику: пока P2P выключен, запросы всё
-                    // равно вернут ERROR, а таймеры зря жгут батарею.
-                    handler.removeCallbacks(discoveryRunnable);
+                    p2pStateEnabled = false;
+                    // Снимаем сторож и обнуляем флаг: все команды supplicant'а
+                    // сейчас вернут BUSY. Цепочки повторов прекращаем, подняв
+                    // номер поколения.
                     handler.removeCallbacks(discoveryWatchdog);
+                    discoveryGeneration.incrementAndGet();
                     discoveryInProgress = false;
+
+                    // Периодический цикл НЕ снимаем: он дежурит и сам возобновит
+                    // поиск, когда радио вернётся — в том числе если прошивка
+                    // не прислала broadcast о включении.
+                    onRadioUnavailable("p2p-disabled");
                 } else {
+                    p2pStateEnabled = true;
+                    radioWarningLogged = false;
                     // Раньше при включении Wi-Fi обратно ничего не происходило:
                     // ни discovery, ни сервисы не перезапускались, и приём
                     // не возвращался до перезапуска приложения.

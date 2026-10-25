@@ -81,6 +81,15 @@ public final class HwGuard {
         return null;
     }
 
+    /** Открыть системные настройки Wi-Fi (переключатель «Использовать Wi-Fi»). */
+    public static void openWifiSettings(Context context) {
+        try {
+            context.startActivity(new Intent(Settings.ACTION_WIFI_SETTINGS)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        } catch (Exception ignored) {
+        }
+    }
+
     /** Открыть системные настройки геолокации. */
     public static void openLocationSettings(Context context) {
         try {
