@@ -19,13 +19,6 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- ==================== OTHER ==================== -->
-    <uses-permission android:name="android.permission.INTERNET" />
-
-    <!-- UDP-канал внутри P2P-группы (B2/B3): приём broadcast-датаграмм
-         presence-маячка. Без этого разрешения часть прошивок режет
-         multicast/broadcast на уровне стека. -->
-    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- Wi-Fi Direct обязателен: без него приложение не работает -->
     <uses-feature

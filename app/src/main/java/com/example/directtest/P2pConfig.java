@@ -215,59 +215,6 @@ public final class P2pConfig {
      */
     public static final long CACHE_TTL = 120_000;
 
-    // ==================== TRANSPORT: СОКЕТЫ ПОВЕРХ P2P-ГРУППЫ ====================
-
-    /**
-     * Транспорт сообщений по TCP поверх P2P-группы — часть быстрого пути (B1).
-     *
-     * ВКЛЮЧЁН: это основной канал доставки, DNS-SD остаётся слоем обнаружения
-     * и резервным путём (TXT-слот публикуется только если ACK не пришёл за
-     * {@link #TXT_FALLBACK_DELAY_MS}).
-     *
-     * Что нужно учитывать:
-     *  - при первом соединении Android может показать системный диалог
-     *    «Принять запрос» на принимающей стороне; повторные соединения идут
-     *    по постоянной группе (SSID + пароль, без WPS) и диалога не требуют;
-     *  - на части прошивок во время активного соединения приостанавливается
-     *    поиск новых устройств — поэтому группа удерживается, а не пересоздаётся;
-     *  - при выходе из зоны группа распадается, приложение переподключается
-     *    само и параллельно продолжает работать по TXT.
-     *
-     * Выключить можно одним флагом: приложение вернётся к доставке через TXT.
-     */
-    public static final boolean ENABLE_P2P_SOCKET_TRANSPORT = true;
-
-    /**
-     * TCP-порт сокетного транспорта
-     */
-    public static final int SOCKET_PORT = 8988;
-
-    /**
-     * Таймаут подключения к владельцу группы (мс)
-     */
-    public static final int SOCKET_CONNECT_TIMEOUT_MS = 8_000;
-
-    /**
-     * Количество попыток подключения к владельцу группы
-     */
-    public static final int SOCKET_CONNECT_ATTEMPTS = 5;
-
-    /**
-     * Таймаут чтения из сокета (мс). Если данных нет дольше — соединение
-     * считается мёртвым и закрывается.
-     */
-    public static final int SOCKET_READ_TIMEOUT_MS = 60_000;
-
-    /**
-     * Интервал heartbeat внутри сокетного соединения (мс)
-     */
-    public static final long SOCKET_HB_INTERVAL_MS = 15_000;
-
-    /**
-     * Минимальный интервал между попытками сформировать P2P-группу (мс)
-     */
-    public static final long GROUP_RETRY_INTERVAL_MS = 30_000;
-
     // ==================== A1: ПРИОРИТЕТНЫЙ ПОИСК ====================
 
     /**
@@ -338,115 +285,11 @@ public final class P2pConfig {
      */
     public static final long PEERS_POLL_INTERVAL_MS = 3_000;
 
-    // ==================== A5/A6: ГРУППА ====================
-
-    /**
-     * Переиспользовать постоянную группу (persistent group, API 29+).
-     * Повторный контакт с уже знакомым телефоном занимает ~1 с вместо 3–9 с,
-     * потому что WPS-негоциация не выполняется.
-     */
-    public static final boolean ENABLE_PERSISTENT_GROUP = true;
-
-    /** Префикс имени сети группы. Имя одинаковое у обеих сторон — залог переиспользования. */
-    public static final String PERSISTENT_GROUP_PREFIX = "DIRECT-RD-";
-
-    /** Пароль группы (8..63 символа). */
-    public static final String PERSISTENT_GROUP_PASSPHRASE = "ra-dio-2026-wifi";
-
-    /**
-     * Диапазон группы (D5): 0 — авто, 1 — 2,4 ГГц, 2 — 5 ГГц.
-     * 2,4 ГГц по умолчанию: дальше и совместимее на бюджетных чипсетах.
-     */
-    public static final int GROUP_BAND_AUTO = 0;
-    public static final int GROUP_BAND_24 = 1;
-    public static final int GROUP_BAND_5 = 2;
-    public static final int PREFERRED_GROUP_BAND = GROUP_BAND_24;
-
-    /**
-     * Сколько времени группа считается «нужной» после последнего контакта (мс), A7.
-     * Пока собеседник рядом, группу не рвём: пересоздание стоит 3–9 секунд.
-     */
-    public static final long KEEP_GROUP_GRACE_MS = 30_000;
-
-    // ==================== B1: БЫСТРЫЙ ПУТЬ КАК ОСНОВНОЙ ====================
-
-    /**
-     * Сокет/групповой канал — основной путь доставки, TXT — резервный.
-     *
-     * Как работает: сообщение сразу уходит по быстрому каналу; публикация в
-     * TXT-слот откладывается на {@link #TXT_FALLBACK_DELAY_MS}. Если за это
-     * время пришёл ACK — TXT вообще не используется (экономия эфира и
-     * отсутствие «мигающих» сервисов). Если нет — включается прежний
-     * надёжный путь.
-     */
-    public static final boolean SOCKET_IS_PRIMARY_PATH = true;
-
-    /** Задержка перед публикацией TXT-слота при работающем быстром канале (мс). */
-    public static final long TXT_FALLBACK_DELAY_MS = 1_500;
-
-    // ==================== B2/B3: КАНАЛ ВНУТРИ ГРУППЫ ====================
-
-    /** UDP-канал внутри подсети группы (самый быстрый путь). */
-    public static final boolean ENABLE_GROUP_LINK_CHANNEL = true;
-
-    /** Порт UDP-канала в подсети группы (один и тот же у всех участников). */
-    public static final int GROUP_LINK_PORT = 8989;
-
-    /** Период presence-маячка владельца группы (мс). */
-    public static final int GROUP_LINK_BEACON_MS = 1_000;
-
-    /** Максимальный размер полезной нагрузки, отправляемой одной датаграммой. */
-    public static final int GROUP_LINK_MAX_DATAGRAM = 1_200;
-
-    /**
-     * mDNS ({@code NsdManager}) поверх линка группы (B2).
-     *
-     * <p>По умолчанию ВЫКЛЮЧЕНО. На части прошивок NsdManager не умеет
-     * работать через P2P-интерфейс (регистрация уходит в default network) и
-     * молча ничего не находит. Основной «быстрый» механизм — UDP-канал
-     * ({@link #ENABLE_GROUP_LINK_CHANNEL}), который не зависит от выбора
-     * интерфейса. Флаг оставлен для экспериментов на устройствах, где
-     * NsdManager через группу работает.
-     */
-    public static final boolean ENABLE_MDNS_ON_GROUP = false;
-
-    // ==================== B5/B6/B7/B8: НАДЁЖНОСТЬ И ТАЙМАУТЫ ====================
-
-    /** Интервал keep-alive в быстром канале (мс), B7. 15 с недостаточно: power-save рвёт. */
-    public static final long SOCKET_KEEPALIVE_MS = 5_000;
-
-    /** Лестница повторов (мс), B6: 1 → 2 → 4 → 8. */
-    public static final long[] RETRY_LADDER_MS = {1_000, 2_000, 4_000, 8_000};
-
-    /** Нижняя граница адаптивного таймаута ожидания ACK (мс), B8. */
-    public static final long ADAPTIVE_RTO_MIN_MS = 300;
-
-    /** Верхняя граница адаптивного таймаута (мс), B8. */
-    public static final long ADAPTIVE_RTO_MAX_MS = 8_000;
-
-    /** Множитель SRTT для расчёта RTO (как в TCP). */
-    public static final double ADAPTIVE_RTO_FACTOR = 4.0;
-
-    /** Интервал фонового замера RTT (мс). */
-    public static final long RTT_PROBE_INTERVAL_MS = 5_000;
-
-    // ==================== C: ГАРАНТИИ ДОСТАВКИ ====================
-
-    /** Ретрансляция через посредника — расширяет дальность без Bluetooth (C6). */
-    public static final boolean ENABLE_RELAY = true;
-
-    /** Сколько дополнительных хопов допускается (1 — только прямой сосед). */
-    public static final int RELAY_TTL = 1;
-
     /** Ускоренная проверка SYNC, когда есть неподтверждённые сообщения (мс). */
     public static final long SYNC_FAST_CHECK_MS = 5_000;
 
     /** Размер Bloom-фильтра ID сообщений в SYNC-записи (бит). */
     public static final int BLOOM_BITS = 128;
-
-    /** Приоритет сообщения: 0 — обычное, 1 — срочное (обгоняет остальные в очереди). */
-    public static final int PRIORITY_NORMAL = 0;
-    public static final int PRIORITY_URGENT = 1;
 
     // ==================== D: ВЕНДОРСКАЯ СОВМЕСТИМОСТЬ ====================
 
@@ -466,21 +309,6 @@ public final class P2pConfig {
     public static final long RADIO_SELF_HEAL_MS = 15_000;
 
     /**
-     * Разрешить приложению инициировать P2P-группу (connect).
-     *
-     * Выключается, если на прошивке формирование группы мешает обнаружению:
-     * тогда приложение работает только по TXT-пути, как в версии 4.
-     */
-    public static final boolean ENABLE_GROUP_INITIATION = true;
-
-    /**
-     * Минимальная пауза между неудачными попытками connect (мс).
-     * Каждая следующая неудача удваивает паузу до {@link #GROUP_RETRY_INTERVAL_MS} × 8,
-     * чтобы не долбить supplicant, пока собеседник реально не готов.
-     */
-    public static final long GROUP_INIT_BACKOFF_BASE_MS = 5_000;
-
-    /**
      * Период обновления основной записи WFD_Main (мс), D8.
      * Heartbeat уже публикует её каждые 5 с — это верхняя граница.
      */
@@ -488,11 +316,6 @@ public final class P2pConfig {
 
     // ==================== PROTOCOL VERSION ====================
 
-    /**
-     * Версия протокола.
-     *
-     * 5 — переход на бинарные кадры (B4), канал внутри группы (B2/B3),
-     * ретрансляция (C6). Устройства с версией 4 продолжают работать по TXT.
-     */
-    public static final String PROTOCOL_VERSION = "5";
+    /** Версия TXT-протокола DNS-SD. */
+    public static final String PROTOCOL_VERSION = "6";
 }

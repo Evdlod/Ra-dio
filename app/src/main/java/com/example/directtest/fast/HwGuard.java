@@ -140,39 +140,8 @@ public final class HwGuard {
                 + "|api=" + Build.VERSION.SDK_INT
                 + "|p2p=" + (isWifiDirectSupported(context) ? 1 : 0)
                 + "|wifi=" + (isWifiEnabled(context) ? 1 : 0)
-                + "|loc=" + (isLocationEnabled(context) ? 1 : 0)
-                + "|persistent=" + (supportsPersistentGroup() ? 1 : 0)
-                + "|band=" + (supportsBandSelection() ? 1 : 0);
+                + "|loc=" + (isLocationEnabled(context) ? 1 : 0);
     }
 
-    /** Persistent group доступна с API 29 (D/A6). */
-    public static boolean supportsPersistentGroup() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q;
-    }
 
-    /** Выбор диапазона группы — тоже с API 29. */
-    public static boolean supportsBandSelection() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q;
-    }
-
-    /** Явный выбор диапазона Wi-Fi Direct (D5): 2,4 ГГц по умолчанию. */
-    public static int preferredBand() {
-        return P2pBand.classify(P2pBand.PREFERRED);
-    }
-
-    /** Вспомогательный класс без зависимостей от android.net.wifi.p2p. */
-    public static final class P2pBand {
-        public static final int AUTO = 0;
-        public static final int BAND_24 = 1;
-        public static final int BAND_5 = 2;
-        /** 2,4 ГГц: дальше и стабильнее на бюджетных чипсетах. */
-        public static final int PREFERRED = BAND_24;
-
-        private P2pBand() {
-        }
-
-        static int classify(int band) {
-            return band;
-        }
-    }
 }
