@@ -1,6 +1,7 @@
 package com.example.directtest.model;
 
 import android.net.wifi.p2p.WifiP2pDevice;
+import android.os.SystemClock;
 
 import com.example.directtest.P2pConfig;
 
@@ -37,8 +38,14 @@ public class DiscoveredDevice {
     /** Время первого обнаружения (мс) */
     public long firstSeen;
 
-    /** Время последнего обнаружения (мс) */
+    /** Последнее TXT-событие приложения (wall-clock, мс). */
     public long lastSeen;
+
+    /** Последнее появление в системном списке Wi-Fi Direct пиров (wall-clock, мс). */
+    public long lastP2pPeerSeen;
+
+    /** Последняя TXT-запись приложения (wall-clock, мс). */
+    public long lastTxtSeen;
 
     /** Количество обнаружений */
     public int seenCount;
@@ -51,8 +58,11 @@ public class DiscoveredDevice {
     /** Предыдущий номер heartbeat */
     public long prevHeartbeatSeq;
 
-    /** Время получения последнего heartbeat (мс) */
+    /** Время получения последнего heartbeat (wall-clock, для UI/логов). */
     public long lastHeartbeatReceived;
+
+    /** Время последнего heartbeat по монотонным часам — только для online TTL. */
+    private long lastHeartbeatElapsedRealtime;
 
     // ==================== SESSION ====================
 
@@ -152,7 +162,9 @@ public class DiscoveredDevice {
      * @return true если устройство отвечало недавно
      */
     public boolean isOnline() {
-        return System.currentTimeMillis() - lastSeen < P2pConfig.DEVICE_ONLINE_THRESHOLD;
+        return lastHeartbeatElapsedRealtime > 0
+                && SystemClock.elapsedRealtime() - lastHeartbeatElapsedRealtime
+                < P2pConfig.DEVICE_ONLINE_THRESHOLD;
     }
 
     /**
@@ -188,11 +200,25 @@ public class DiscoveredDevice {
      * @param newSeq новый номер последовательности
      */
     public void updateHeartbeat(long newSeq) {
-        if (newSeq != heartbeatSeq) {
+        // Первая запись с hb=0 тоже подтверждает presence. Повтор cached-TXT
+        // с тем же счётчиком не продлевает online lease.
+        if (lastHeartbeatElapsedRealtime == 0 || newSeq != heartbeatSeq) {
             prevHeartbeatSeq = heartbeatSeq;
             heartbeatSeq = newSeq;
             lastHeartbeatReceived = System.currentTimeMillis();
+            lastHeartbeatElapsedRealtime = SystemClock.elapsedRealtime();
         }
+    }
+
+    /** Сбросить heartbeat lease при переходе собеседника на новую сессию. */
+    public void resetHeartbeatForNewSession() {
+        prevHeartbeatSeq = 0;
+        heartbeatSeq = 0;
+        lastHeartbeatReceived = 0;
+        lastHeartbeatElapsedRealtime = 0;
+        wasOnlineLastCheck = false;
+        clockSkewMs = 0;
+        hasClockSkew = false;
     }
 
     /**
@@ -422,5 +448,7 @@ public class DiscoveredDevice {
         heartbeatSeq = 0;
         prevHeartbeatSeq = 0;
         lastHeartbeatReceived = 0;
+        lastHeartbeatElapsedRealtime = 0;
+        wasOnlineLastCheck = false;
     }
 }
