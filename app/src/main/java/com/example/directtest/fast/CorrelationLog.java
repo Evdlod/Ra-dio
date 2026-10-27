@@ -60,8 +60,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *       {@code MSG_RX} (dev=B) → {@code ACK_TX} (dev=B) → {@code ACK_RX}
  *       (dev=A).</li>
  *   <li>Разницу {@code t_utc_ms} читать как задержку; систематическое
- *       смещение пары компенсировать полем {@code skew_ms} из событий
- *       {@code CLOCK} — оно уже посчитано в {@link PeerClock}.</li>
+ *       смещение пары оценивать по времени TXT-heartbeat и полю {@code skew_ms}.</li>
  * </ol>
  *
  * Формат специально плоский (TSV): открывается в Excel / pandas без
